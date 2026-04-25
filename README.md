@@ -2,8 +2,7 @@
 
 A lightweight single-file web app for browsing and comparing your [Weights & Biases](https://wandb.ai) training runs — no cloud, no install, runs entirely in your browser.
 
-**[▶ Open Online](https://your-username.github.io/W-B_Logs_Management)**  
-*(replace with your actual GitHub Pages URL after publishing)*
+**[▶ Open Online](https://matchayou.github.io/WB-Logs-Management)**
 
 ---
 
@@ -39,7 +38,7 @@ python proxy.py
 Requires Python 3 (no extra packages needed).
 
 ```bash
-git clone https://github.com/your-username/W-B_Logs_Management.git
+git clone https://github.com/Matchayou/WB-Logs-Management.git
 cd W-B_Logs_Management
 python run.py
 ```
