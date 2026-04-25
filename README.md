@@ -13,6 +13,7 @@ A lightweight single-file web app for browsing and comparing your [Weights & Bia
 - Compare runs side-by-side (charts, params diff, custom config)
 - Multi-select tag & state filters, per-project sort/field preferences
 - Command-line args auto-parsed into Config view
+- Bilingual UI: switch between Chinese and English in Settings
 - All data stays local — nothing is stored outside your browser
 
 ---

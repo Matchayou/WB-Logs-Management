@@ -21,6 +21,45 @@
     a { color: inherit; }
   </style>
   <script>// W&B API
+function getAppLanguage() {
+  try {
+    return WBStore?.getSettings?.().language === 'en' ? 'en' : 'zh';
+  } catch {
+    return 'zh';
+  }
+}
+
+function apiText(key, vars = {}) {
+  const lang = getAppLanguage();
+  const dict = {
+    zh: {
+      fillProxy: '请先在设置中填写本地代理地址（运行 proxy.py 后填入 http://localhost:8080）',
+      invalidKey: 'API Key 无效，请检查',
+      forbidden: '无权访问，请确认 Entity / Project 名称',
+      missingProject: `找不到项目 "${vars.project}"，请检查 Entity 和 Project 名称`,
+      missingProjectSimple: `找不到项目 "${vars.project}"`,
+      viewerFailed: 'API Key 无效，无法获取用户信息',
+      noProjects: `在 [${vars.entities}] 下均未找到项目，请确认 Entity 名称`,
+      needProxyLogs: '需要配置本地代理才能获取日志文件',
+      needProxyMeta: '需要配置本地代理才能获取 metadata',
+      logFetchFailed: `日志文件获取失败 HTTP ${vars.status}`,
+    },
+    en: {
+      fillProxy: 'Please set the local proxy URL in Settings (run proxy.py first, then use http://localhost:8080).',
+      invalidKey: 'Invalid API key. Please check it.',
+      forbidden: 'Access denied. Please verify the entity and project names.',
+      missingProject: `Project "${vars.project}" was not found. Please verify the entity and project names.`,
+      missingProjectSimple: `Project "${vars.project}" was not found.`,
+      viewerFailed: 'Invalid API key. Failed to load viewer information.',
+      noProjects: `No projects were found under [${vars.entities}]. Please verify the entity name.`,
+      needProxyLogs: 'A local proxy is required to fetch log files.',
+      needProxyMeta: 'A local proxy is required to fetch metadata.',
+      logFetchFailed: `Failed to fetch log file: HTTP ${vars.status}`,
+    },
+  };
+  return dict[lang][key];
+}
+
 const WBApi = (() => {
   const GQL = 'https://api.wandb.ai/graphql';
 
@@ -32,7 +71,7 @@ const WBApi = (() => {
 
   async function gqlWithProxy(apiKey, query, variables, _unused, customProxyOverride) {
     const customProxy = (customProxyOverride !== undefined ? customProxyOverride : (WBStore.getSettings().customProxy || '')).trim();
-    if (!customProxy) throw new Error('请先在设置中填写本地代理地址（运行 proxy.py 后填入 http://localhost:8080）');
+    if (!customProxy) throw new Error(apiText('fillProxy'));
     const endpoint = customProxy.replace(/\/$/, '');
     const res = await fetch(endpoint, {
       method: 'POST',
@@ -44,8 +83,8 @@ const WBApi = (() => {
     });
     if (!res.ok) {
       let msg = `HTTP ${res.status}`;
-      if (res.status === 401) msg = 'API Key 无效，请检查';
-      if (res.status === 403) msg = '无权访问，请确认 Entity / Project 名称';
+      if (res.status === 401) msg = apiText('invalidKey');
+      if (res.status === 403) msg = apiText('forbidden');
       throw new Error(msg);
     }
     const json = await res.json();
@@ -82,7 +121,7 @@ const WBApi = (() => {
     let all = [], after = null, hasNext = true;
     while (hasNext) {
       const data = await gqlWithProxy(apiKey, RUNS_QUERY, { entity, project, first: 100, after });
-      if (!data.project) throw new Error(`找不到项目 "${project}"，请检查 Entity 和 Project 名称`);
+      if (!data.project) throw new Error(apiText('missingProject', { project }));
       const { edges, pageInfo } = data.project.runs;
       const runs = edges.map(e => parseRun(e.node));
       all = all.concat(runs);
@@ -126,7 +165,7 @@ const WBApi = (() => {
 
   async function testConnection(apiKey, entity, project, _unused, customProxyOverride) {
     const data = await gqlWithProxy(apiKey, RUNS_QUERY, { entity, project, first: 1 }, null, customProxyOverride);
-    if (!data.project) throw new Error(`找不到项目 "${project}"`);
+    if (!data.project) throw new Error(apiText('missingProjectSimple', { project }));
     return data;
   }
 
@@ -141,7 +180,7 @@ const WBApi = (() => {
       }
     `;
     const vd = await gqlWithProxy(apiKey, viewerQuery, {}, null, customProxyOverride);
-    if (!vd.viewer) throw new Error('API Key 无效，无法获取用户信息');
+    if (!vd.viewer) throw new Error(apiText('viewerFailed'));
 
     const entities = new Set();
     if (entity.trim()) entities.add(entity.trim());
@@ -165,7 +204,7 @@ const WBApi = (() => {
       });
     }
     if (all.length === 0)
-      throw new Error(`在 [${[...entities].join(', ')}] 下均未找到项目，请确认 Entity 名称`);
+      throw new Error(apiText('noProjects', { entities: [...entities].join(', ') }));
     return all;
   }
 
@@ -190,12 +229,12 @@ const WBApi = (() => {
     if (!fileUrl) return null;
 
     const proxyBase = (WBStore.getSettings().customProxy || '').replace(/\/$/, '');
-    if (!proxyBase) throw new Error('需要配置本地代理才能获取日志文件');
+    if (!proxyBase) throw new Error(apiText('needProxyLogs'));
 
     // Pre-signed URL: no Authorization header — sending one breaks S3/GCS signature validation
     const res = await fetch(`${proxyBase}?url=${encodeURIComponent(fileUrl)}`);
     if (res.status === 404) return null; // file recorded but not uploaded
-    if (!res.ok) throw new Error(`日志文件获取失败 HTTP ${res.status}`);
+    if (!res.ok) throw new Error(apiText('logFetchFailed', { status: res.status }));
     return await res.text();
   }
 
@@ -218,7 +257,7 @@ const WBApi = (() => {
     const fileUrl = edges[0].node.directUrl;
     if (!fileUrl) return null;
     const proxyBase = (WBStore.getSettings().customProxy || '').replace(/\/$/, '');
-    if (!proxyBase) throw new Error('需要配置本地代理才能获取 metadata');
+    if (!proxyBase) throw new Error(apiText('needProxyMeta'));
     const res = await fetch(`${proxyBase}?url=${encodeURIComponent(fileUrl)}`);
     if (!res.ok) return null;
     return await res.json();
@@ -318,6 +357,293 @@ const WBStore = (() => {
   <script type="text/babel">// Shared UI components
 const { useState, useEffect, useRef, useCallback } = React;
 
+const I18N = {
+  zh: {
+    appTitle: 'W&B 日志管理',
+    appSubtitle: '训练日志管理',
+    connectSubtitle: '连接你的 Weights & Biases 训练数据',
+    justNow: '刚刚',
+    minutesAgo: ({ count }) => `${count}分钟前`,
+    hoursAgo: ({ count }) => `${count}小时前`,
+    daysAgo: ({ count }) => `${count}天前`,
+    state: {
+      finished: '已完成',
+      running: '运行中',
+      crashed: '崩溃',
+      failed: '失败',
+      killed: '已终止',
+      unknown: '未知',
+    },
+    favorite: '收藏',
+    unfavorite: '取消收藏',
+    configReady: '已填写训练配置',
+    epoch: 'Epoch',
+    epochCount: ({ count }) => `本次 ${count} epoch`,
+    countSuffix: '条',
+    searchRuns: '搜索名称、别名、标签…',
+    tags: '标签',
+    stateFilter: '状态',
+    noTags: '无可用标签',
+    noStates: '无可用状态',
+    compareMode: '对比模式',
+    exitCompare: '退出对比',
+    noFavorites: '暂无收藏',
+    noRuns: '没有找到符合条件的训练',
+    addFavoriteHint: '在训练列表中点击 ☆ 添加收藏',
+    adjustFilterHint: '尝试调整搜索或过滤条件',
+    selectedRuns: ({ count }) => `已选 ${count} 条训练`,
+    startCompare: '开始对比 →',
+    clear: '清空',
+    sortBy: ({ label }) => `排序：${label}`,
+    defaultSort: '默认排序',
+    unsetDefaultSort: '取消默认排序',
+    setDefaultSort: '设为默认排序',
+    searchMetrics: '搜索指标…',
+    base: '基础',
+    trainMetrics: '训练指标',
+    otherMetrics: '其他指标',
+    noMatchingMetrics: '无匹配指标',
+    sortTime: '创建时间',
+    sortEpoch: 'Epoch 数',
+    showFields: '显示字段',
+    searchFields: '搜索字段…',
+    basicInfo: '基础信息',
+    summaryMetrics: 'Summary 指标',
+    configParams: 'Config 参数',
+    noMatchingFields: '无匹配字段',
+    reset: '重置',
+    done: '完成',
+    search: '搜索…',
+    clearFilter: '清除筛选',
+    noOptions: '无选项',
+    language: '语言',
+    chinese: '中文',
+    english: 'English',
+    settings: '设置',
+    runList: '训练列表',
+    favorites: '收藏',
+    compare: '对比',
+    pasteApiKey: '粘贴你的 W&B API Key',
+    entityLabel: 'Entity（用户名 / 团队）',
+    projectsLabel: 'Projects（多个用逗号分隔）',
+    browseProjects: '浏览所有项目 →',
+    loading: '加载中…',
+    metricsLabel: '关注的 Metrics（逗号分隔）',
+    minEpochLabel: '最少 Epoch 数',
+    minEpochHint: ({ count }) => `过滤本次训练不足 ${count} 个 epoch 的记录`,
+    proxyLabel: '本地代理地址',
+    proxyHint: '需先在本地运行代理脚本以解决浏览器 CORS 限制：',
+    bundledProxy: '（随项目附带，无需额外安装）',
+    testAndSave: '测试并保存',
+    saveDirectly: '直接保存',
+    testing: '测试中…',
+    settingsTip: '提示：',
+    localOnlyTip: 'API Key 可在 wandb.ai/settings 获取。数据仅存于本地浏览器。',
+    fillApiEntity: '请先填写 API Key 和 Entity',
+    noProjectsFound: '未找到任何项目，请检查 Entity 名称',
+    fetchProjectsFailed: ({ error }) => `获取项目列表失败：${error}`,
+    fillConfig: '请填写完整配置',
+    testSuccess: '✅ 连接成功！',
+    navRefresh: '刷新',
+    validRuns: ({ count, minEpoch }) => `${count} 条有效训练（本次训练 ≥${minEpoch} epoch）`,
+    refresh: '↻ 刷新',
+    loadFailed: '加载失败',
+    retry: '重试',
+    checkSettings: '检查配置',
+    compareNeedRuns: '请先选择至少 2 条训练进行对比',
+    compareNeedRunsHint: '在列表页开启对比模式，勾选训练后回到此页',
+    goList: '去列表页',
+    loadProgress: ({ project, current, total }) => `加载中 ${project}… ${current}/${total}`,
+    detailCharts: '训练曲线',
+    detailOverview: '概览',
+    detailTrainConfig: '训练配置',
+    detailNotes: '备注',
+    addNote: '点击添加备注…',
+    clickToEdit: '点击编辑',
+    tagInput: '输入标签后按 Enter',
+    historyLoadFailed: ({ error }) => `历史数据加载失败：${error}`,
+    noHistory: '暂无历史数据',
+    noMetricData: '该 metric 无数据',
+    searchParams: '搜索参数…',
+    mergeCommandArgs: '合并 Command 参数',
+    noMatchingParams: '无匹配参数',
+    noChartData: '暂无训练曲线数据',
+    chartDataHint: '历史数据未能加载，请检查 API 配置',
+    selectMetricsHint: '请在上方选择要显示的指标',
+    noLogs: '暂无日志',
+    loadLogsHint: '点击加载获取运行日志',
+    emptyLogs: '日志为空',
+    emptyLogsHint: '该 run 的 output.log 没有内容',
+    lines: ({ count }) => `${count} 行`,
+    bottom: '↓ 底部',
+    noOverview: '无概览数据',
+    noOverviewHint: '该 run 未上传 metadata',
+    noConfig: '无 Config 数据',
+    compareRuns: ({ count }) => `对比 ${count} 条训练`,
+    openDetail: '点击查看详情',
+    compareCharts: '曲线对比',
+    compareParams: '参数差异',
+    compareTrainConfig: '配置对比',
+    compareSummary: 'Summary 对比',
+    showSame: '显示相同参数',
+    onlyDiff: '只显示差异',
+    noParams: '无参数',
+    allSame: '所有参数相同',
+    param: '参数',
+    metric: 'Metric',
+    selectCompareMetrics: '请在上方选择要对比的指标',
+    noTrainConfig: '暂无训练配置',
+    noTrainConfigHint: '请在各训练详情页的「训练配置」tab 中粘贴 JSON 后再对比',
+  },
+  en: {
+    appTitle: 'W&B Logs Management',
+    appSubtitle: 'Training logs manager',
+    connectSubtitle: 'Connect to your Weights & Biases training data',
+    justNow: 'just now',
+    minutesAgo: ({ count }) => `${count} min ago`,
+    hoursAgo: ({ count }) => `${count} hr ago`,
+    daysAgo: ({ count }) => `${count} day ago`,
+    state: {
+      finished: 'Finished',
+      running: 'Running',
+      crashed: 'Crashed',
+      failed: 'Failed',
+      killed: 'Killed',
+      unknown: 'Unknown',
+    },
+    favorite: 'Favorite',
+    unfavorite: 'Unfavorite',
+    configReady: 'Training config saved',
+    epoch: 'Epoch',
+    epochCount: ({ count }) => `${count} epochs this run`,
+    countSuffix: '',
+    searchRuns: 'Search name, alias, or tags…',
+    tags: 'Tags',
+    stateFilter: 'State',
+    noTags: 'No tags available',
+    noStates: 'No states available',
+    compareMode: 'Compare mode',
+    exitCompare: 'Exit compare',
+    noFavorites: 'No favorites yet',
+    noRuns: 'No runs match the current filters',
+    addFavoriteHint: 'Click ☆ on a run card to favorite it',
+    adjustFilterHint: 'Try adjusting search or filters',
+    selectedRuns: ({ count }) => `${count} run(s) selected`,
+    startCompare: 'Compare →',
+    clear: 'Clear',
+    sortBy: ({ label }) => `Sort: ${label}`,
+    defaultSort: 'Default sort',
+    unsetDefaultSort: 'Unset default sort',
+    setDefaultSort: 'Set as default sort',
+    searchMetrics: 'Search metrics…',
+    base: 'Base',
+    trainMetrics: 'Training metrics',
+    otherMetrics: 'Other metrics',
+    noMatchingMetrics: 'No metrics matched',
+    sortTime: 'Created time',
+    sortEpoch: 'Epoch count',
+    showFields: 'Fields',
+    searchFields: 'Search fields…',
+    basicInfo: 'Basic info',
+    summaryMetrics: 'Summary metrics',
+    configParams: 'Config params',
+    noMatchingFields: 'No fields matched',
+    reset: 'Reset',
+    done: 'Done',
+    search: 'Search…',
+    clearFilter: 'Clear filter',
+    noOptions: 'No options',
+    language: 'Language',
+    chinese: 'Chinese',
+    english: 'English',
+    settings: 'Settings',
+    runList: 'Runs',
+    favorites: 'Favorites',
+    compare: 'Compare',
+    pasteApiKey: 'Paste your W&B API key',
+    entityLabel: 'Entity (user / team)',
+    projectsLabel: 'Projects (comma-separated)',
+    browseProjects: 'Browse all projects →',
+    loading: 'Loading…',
+    metricsLabel: 'Tracked metrics (comma-separated)',
+    minEpochLabel: 'Minimum epoch count',
+    minEpochHint: ({ count }) => `Hide runs with fewer than ${count} epochs`,
+    proxyLabel: 'Local proxy URL',
+    proxyHint: 'Run the local proxy first to bypass browser CORS:',
+    bundledProxy: '(included with the project, no extra install needed)',
+    testAndSave: 'Test and save',
+    saveDirectly: 'Save only',
+    testing: 'Testing…',
+    settingsTip: 'Tip:',
+    localOnlyTip: 'Get your API key at wandb.ai/settings. Data stays only in your local browser.',
+    fillApiEntity: 'Please fill in API Key and Entity first.',
+    noProjectsFound: 'No projects found. Please verify the entity name.',
+    fetchProjectsFailed: ({ error }) => `Failed to load projects: ${error}`,
+    fillConfig: 'Please complete the required settings.',
+    testSuccess: '✅ Connection successful!',
+    navRefresh: 'Refresh',
+    validRuns: ({ count, minEpoch }) => `${count} valid runs (this run >= ${minEpoch} epochs)`,
+    refresh: '↻ Refresh',
+    loadFailed: 'Failed to load',
+    retry: 'Retry',
+    checkSettings: 'Check settings',
+    compareNeedRuns: 'Select at least 2 runs before comparing',
+    compareNeedRunsHint: 'Enable compare mode in the run list, select runs, then come back here',
+    goList: 'Go to run list',
+    loadProgress: ({ project, current, total }) => `Loading ${project}… ${current}/${total}`,
+    detailCharts: 'Charts',
+    detailOverview: 'Overview',
+    detailTrainConfig: 'Training Config',
+    detailNotes: 'Notes',
+    addNote: 'Click to add notes…',
+    clickToEdit: 'Click to edit',
+    tagInput: 'Type a tag and press Enter',
+    historyLoadFailed: ({ error }) => `Failed to load history: ${error}`,
+    noHistory: 'No history data',
+    noMetricData: 'No data for this metric',
+    searchParams: 'Search params…',
+    mergeCommandArgs: 'Merge command args',
+    noMatchingParams: 'No params matched',
+    noChartData: 'No chart data',
+    chartDataHint: 'History data could not be loaded. Check your API settings.',
+    selectMetricsHint: 'Select metrics above to display',
+    noLogs: 'No logs',
+    loadLogsHint: 'Click to load the run logs',
+    emptyLogs: 'Empty logs',
+    emptyLogsHint: 'This run has an empty output.log',
+    lines: ({ count }) => `${count} lines`,
+    bottom: '↓ Bottom',
+    noOverview: 'No overview data',
+    noOverviewHint: 'This run did not upload metadata',
+    noConfig: 'No config data',
+    compareRuns: ({ count }) => `Comparing ${count} runs`,
+    openDetail: 'Open details',
+    compareCharts: 'Charts',
+    compareParams: 'Param Diff',
+    compareTrainConfig: 'Config Diff',
+    compareSummary: 'Summary Diff',
+    showSame: 'Show same values',
+    onlyDiff: 'Differences only',
+    noParams: 'No params',
+    allSame: 'All params are identical',
+    param: 'Parameter',
+    metric: 'Metric',
+    selectCompareMetrics: 'Select metrics above to compare',
+    noTrainConfig: 'No training config',
+    noTrainConfigHint: 'Paste JSON in the Training Config tab of each run before comparing',
+  },
+};
+
+function getLang() {
+  return WBStore.getSettings().language === 'en' ? 'en' : 'zh';
+}
+
+function t(key, vars = {}, lang = getLang()) {
+  const value = key.split('.').reduce((acc, part) => acc?.[part], I18N[lang]);
+  if (typeof value === 'function') return value(vars);
+  return value ?? key;
+}
+
 const TAG_PALETTE = [
   { bg: '#EEF1FF', fg: '#3B5BDB' },
   { bg: '#EBFBEE', fg: '#2F9E44' },
@@ -359,13 +685,15 @@ function TagChip({ tag, tagLib, onRemove, small }) {
 }
 
 function StateBadge({ state }) {
+  const lang = getLang();
   const MAP = {
-    finished: { bg: '#DCFCE7', fg: '#15803D', label: '已完成' },
-    running:  { bg: '#DBEAFE', fg: '#1D4ED8', label: '运行中' },
-    crashed:  { bg: '#FEE2E2', fg: '#DC2626', label: '崩溃'   },
-    failed:   { bg: '#FEE2E2', fg: '#DC2626', label: '失败'   },
+    finished: { bg: '#DCFCE7', fg: '#15803D', label: t('state.finished', {}, lang) },
+    running:  { bg: '#DBEAFE', fg: '#1D4ED8', label: t('state.running', {}, lang) },
+    crashed:  { bg: '#FEE2E2', fg: '#DC2626', label: t('state.crashed', {}, lang) },
+    failed:   { bg: '#FEE2E2', fg: '#DC2626', label: t('state.failed', {}, lang) },
+    killed:   { bg: '#FEF3C7', fg: '#D97706', label: t('state.killed', {}, lang) },
   };
-  const s = MAP[state] || { bg: '#F3F4F6', fg: '#6B7280', label: state || '未知' };
+  const s = MAP[state] || { bg: '#F3F4F6', fg: '#6B7280', label: state || t('state.unknown', {}, lang) };
   return (
     <span style={{
       padding: '2px 8px', borderRadius: 20, fontSize: 11, fontWeight: 600,
@@ -375,6 +703,7 @@ function StateBadge({ state }) {
 }
 
 function StarBtn({ active, onClick }) {
+  const lang = getLang();
   return (
     <button onClick={e => { e.stopPropagation(); onClick(); }} style={{
       border: 'none', background: 'none', cursor: 'pointer',
@@ -385,7 +714,7 @@ function StarBtn({ active, onClick }) {
     }}
     onMouseEnter={e => e.currentTarget.style.transform = 'scale(1.2)'}
     onMouseLeave={e => e.currentTarget.style.transform = 'scale(1)'}
-    title={active ? '取消收藏' : '收藏'}>
+    title={active ? t('unfavorite', {}, lang) : t('favorite', {}, lang)}>
       {active ? '★' : '☆'}
     </button>
   );
@@ -466,6 +795,7 @@ function Modal({ open, onClose, title, children, width = 480 }) {
 }
 
 function RunCard({ run, meta, tagLib, onToggleFav, onSelect, selected, onOpen, compareMode, metrics, cardFields }) {
+  const lang = getLang();
   const alias = meta.alias || run.displayName || run.name;
   const origName = run.name;
   const hasConfig = React.useMemo(() => !!WBStore.getCustomConfig(run.name).trim(), [run.name]);
@@ -507,7 +837,7 @@ function RunCard({ run, meta, tagLib, onToggleFav, onSelect, selected, onOpen, c
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontWeight: 600, fontSize: 14, color: '#1C1A17', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 5 }}>
             <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{alias}</span>
-            {hasConfig && <span title="已填写训练配置" style={{ flexShrink: 0, width: 16, height: 16, borderRadius: '50%', background: '#2F9E44', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, color: '#fff', fontWeight: 700 }}>✓</span>}
+            {hasConfig && <span title={t('configReady', {}, lang)} style={{ flexShrink: 0, width: 16, height: 16, borderRadius: '50%', background: '#2F9E44', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, color: '#fff', fontWeight: 700 }}>✓</span>}
           </div>
           {alias !== origName && (
             <div style={{ fontSize: 11, color: '#B0A99E', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 1 }}>{origName}</div>
@@ -529,11 +859,11 @@ function RunCard({ run, meta, tagLib, onToggleFav, onSelect, selected, onOpen, c
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14, fontSize: 12, color: '#6B6560', alignItems: 'center' }}>
           {fields.includes('epoch') && (() => {
             const epoch = (run.summary || {}).epoch ?? (run.summary || {})._epoch;
-            return epoch != null ? <span>Epoch&nbsp;<strong style={{ color: '#1C1A17', fontSize: 13 }}>{epoch}</strong></span> : null;
+            return epoch != null ? <span>{t('epoch', {}, lang)}&nbsp;<strong style={{ color: '#1C1A17', fontSize: 13 }}>{epoch}</strong></span> : null;
           })()}
           {fields.includes('epochCount') && (() => {
             const count = getEpochCount(run);
-            return count != null ? <span>本次&nbsp;<strong style={{ color: '#1C1A17', fontSize: 13 }}>{count}</strong>&nbsp;epoch</span> : null;
+            return count != null ? <span><strong style={{ color: '#1C1A17', fontSize: 13 }}>{t('epochCount', { count }, lang)}</strong></span> : null;
           })()}
           {extraFields.map(k => {
             const v = (run.summary || {})[k] ?? config[k];
@@ -554,14 +884,15 @@ function RunCard({ run, meta, tagLib, onToggleFav, onSelect, selected, onOpen, c
 }
 
 function fmtTime(ts) {
+  const lang = getLang();
   if (!ts) return '';
   const d = new Date(ts), now = new Date();
   const diff = (now - d) / 1000;
-  if (diff < 60) return '刚刚';
-  if (diff < 3600) return `${Math.floor(diff / 60)}分钟前`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}小时前`;
-  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)}天前`;
-  return d.toLocaleDateString('zh-CN');
+  if (diff < 60) return t('justNow', {}, lang);
+  if (diff < 3600) return t('minutesAgo', { count: Math.floor(diff / 60) }, lang);
+  if (diff < 86400) return t('hoursAgo', { count: Math.floor(diff / 3600) }, lang);
+  if (diff < 86400 * 30) return t('daysAgo', { count: Math.floor(diff / 86400) }, lang);
+  return d.toLocaleDateString(lang === 'en' ? 'en-US' : 'zh-CN');
 }
 
 function parseConfig(config = {}) {
@@ -625,6 +956,7 @@ function flattenJson(obj, prefix = '') {
 }
 
 function CustomConfigTab({ runName }) {
+  const lang = getLang();
   const [text, setText] = React.useState(() => WBStore.getCustomConfig(runName));
   const [parsed, setParsed] = React.useState(null);
   const [parseError, setParseError] = React.useState('');
@@ -642,8 +974,8 @@ function CustomConfigTab({ runName }) {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
       <div>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-          <span style={{ fontSize: 11, fontWeight: 600, color: '#6B6560', textTransform: 'uppercase', letterSpacing: '0.04em' }}>粘贴训练配置 JSON</span>
-          {text && <button onClick={() => handleChange('')} style={{ border: 'none', background: 'none', cursor: 'pointer', color: '#B0A99E', fontSize: 11, fontFamily: 'inherit' }}>清除</button>}
+          <span style={{ fontSize: 11, fontWeight: 600, color: '#6B6560', textTransform: 'uppercase', letterSpacing: '0.04em' }}>{lang === 'en' ? 'Paste training config JSON' : '粘贴训练配置 JSON'}</span>
+          {text && <button onClick={() => handleChange('')} style={{ border: 'none', background: 'none', cursor: 'pointer', color: '#B0A99E', fontSize: 11, fontFamily: 'inherit' }}>{t('clear', {}, lang)}</button>}
         </div>
         <textarea value={text} onChange={e => handleChange(e.target.value)}
           placeholder={'{\n  "learning_rate": 0.001,\n  "batch_size": 32\n}'}
@@ -651,13 +983,13 @@ function CustomConfigTab({ runName }) {
             borderRadius: 8, border: `1px solid ${parseError ? '#E03131' : '#E4E1DA'}`,
             fontFamily: 'monospace', fontSize: 12, lineHeight: 1.6, resize: 'vertical',
             outline: 'none', background: '#FAFAF8', color: '#1C1A17' }} />
-        {parseError && <div style={{ color: '#E03131', fontSize: 11, marginTop: 4 }}>JSON 解析错误：{parseError}</div>}
+        {parseError && <div style={{ color: '#E03131', fontSize: 11, marginTop: 4 }}>{lang === 'en' ? 'JSON parse error: ' : 'JSON 解析错误：'}{parseError}</div>}
       </div>
       {entries.length > 0 && (
         <div>
           <div style={{ fontSize: 11, fontWeight: 600, color: '#6B6560', marginBottom: 6,
             textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-            识别结果 · {entries.length} 个参数
+            {lang === 'en' ? `Parsed result · ${entries.length} params` : `识别结果 · ${entries.length} 个参数`}
           </div>
           <div style={{ borderRadius: 8, border: '1px solid #E4E1DA', overflow: 'hidden' }}>
             {entries.map(([k, v], i) => (
@@ -676,7 +1008,7 @@ function CustomConfigTab({ runName }) {
         </div>
       )}
       {text.trim() && !parseError && entries.length === 0 && (
-        <div style={{ color: '#9D9890', fontSize: 13, textAlign: 'center', padding: 20 }}>JSON 为空对象</div>
+        <div style={{ color: '#9D9890', fontSize: 13, textAlign: 'center', padding: 20 }}>{lang === 'en' ? 'JSON is an empty object' : 'JSON 为空对象'}</div>
       )}
     </div>
   );
@@ -693,6 +1025,7 @@ const { useState, useMemo, useCallback, useRef, useEffect } = React;
 
 // Inner component: all per-project state lives here; key prop resets it on tab switch
 function ProjectRunList({ runs, allMeta, tagLib, onToggleFav, onOpenRun, compareSelected, onToggleCompare, favOnly, metrics, cardFields, onChangeCardFields, defaultSortKey, onSetDefaultSort, filterStates, onFilterStatesChange }) {
+  const lang = getLang();
   const [search, setSearch] = useState('');
   const [filterTags, setFilterTags] = useState([]);
   const [sortKey, setSortKey] = useState(defaultSortKey);
@@ -764,32 +1097,32 @@ function ProjectRunList({ runs, allMeta, tagLib, onToggleFav, onOpenRun, compare
       <div style={{ padding: '12px 16px', borderBottom: '1px solid #E4E1DA', background: '#FAFAF8', flexShrink: 0 }}>
         <div style={{ position: 'relative', marginBottom: 10 }}>
           <span style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: '#B0A99E', fontSize: 15 }}>🔍</span>
-          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索名称、别名、标签…"
+          <input value={search} onChange={e => setSearch(e.target.value)} placeholder={t('searchRuns', {}, lang)}
             style={{ width: '100%', boxSizing: 'border-box', padding: '8px 12px 8px 34px', borderRadius: 8,
               border: '1px solid #E4E1DA', fontSize: 13, background: '#fff', fontFamily: 'inherit', outline: 'none', color: '#1C1A17' }} />
         </div>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
           <MultiSelectPicker
-            label="标签" selected={filterTags} onChange={setFilterTags}
+            label={t('tags', {}, lang)} selected={filterTags} onChange={setFilterTags}
             options={allTags.map(t => ({ key: t, label: t }))}
-            emptyText="无可用标签"
+            emptyText={t('noTags', {}, lang)}
           />
           <MultiSelectPicker
-            label="状态" selected={filterStates} onChange={onFilterStatesChange}
+            label={t('stateFilter', {}, lang)} selected={filterStates} onChange={onFilterStatesChange}
             options={[
-              { key: 'finished', label: '已完成', color: '#2F9E44' },
-              { key: 'running',  label: '运行中',  color: '#1971C2' },
-              { key: 'crashed',  label: '崩溃',   color: '#C92A2A' },
-              { key: 'killed',   label: '已终止',  color: '#E67700' },
+              { key: 'finished', label: t('state.finished', {}, lang), color: '#2F9E44' },
+              { key: 'running',  label: t('state.running', {}, lang), color: '#1971C2' },
+              { key: 'crashed',  label: t('state.crashed', {}, lang), color: '#C92A2A' },
+              { key: 'killed',   label: t('state.killed', {}, lang), color: '#E67700' },
             ]}
-            emptyText="无可用状态"
+            emptyText={t('noStates', {}, lang)}
           />
           <SortPicker sortKey={sortKey} sortDir={sortDir} onSort={handleSortKey} onDir={setSortDir}
             sortableKeys={sortableKeys} metrics={metrics} defaultKey={defaultSortKey} onSetDefault={onSetDefaultSort} />
           <FieldPicker cardFields={cardFields} onChangeFields={onChangeCardFields} summaryKeys={summaryKeys} configKeys={configKeys} />
-          <span style={{ marginLeft: 'auto', fontSize: 12, color: '#9D9890' }}>{filtered.length} 条</span>
+          <span style={{ marginLeft: 'auto', fontSize: 12, color: '#9D9890' }}>{filtered.length}{t('countSuffix', {}, lang)}</span>
           <Btn small variant={compareMode ? 'primary' : 'ghost'} onClick={() => setCompareMode(m => !m)}>
-            {compareMode ? '退出对比' : '对比模式'}
+            {compareMode ? t('exitCompare', {}, lang) : t('compareMode', {}, lang)}
           </Btn>
         </div>
       </div>
@@ -798,8 +1131,8 @@ function ProjectRunList({ runs, allMeta, tagLib, onToggleFav, onOpenRun, compare
       <div style={{ flex: 1, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 10 }}>
         {filtered.length === 0 ? (
           <EmptyState icon={favOnly ? '⭐' : '📭'}
-            title={favOnly ? '暂无收藏' : '没有找到符合条件的训练'}
-            desc={favOnly ? '在训练列表中点击 ☆ 添加收藏' : '尝试调整搜索或过滤条件'} />
+            title={favOnly ? t('noFavorites', {}, lang) : t('noRuns', {}, lang)}
+            desc={favOnly ? t('addFavoriteHint', {}, lang) : t('adjustFilterHint', {}, lang)} />
         ) : filtered.map(run => (
           <RunCard key={run.name} run={run} meta={allMeta[run.name] || {}} tagLib={tagLib}
             onToggleFav={onToggleFav} onOpen={onOpenRun} compareMode={compareMode}
@@ -815,15 +1148,15 @@ function ProjectRunList({ runs, allMeta, tagLib, onToggleFav, onOpenRun, compare
           padding: '12px 20px', display: 'flex', alignItems: 'center', gap: 12,
           borderTop: '1px solid #333', flexShrink: 0,
         }}>
-          <span style={{ flex: 1, fontSize: 14 }}>已选 <strong>{selectedCount}</strong> 条训练</span>
+          <span style={{ flex: 1, fontSize: 14 }}>{t('selectedRuns', { count: selectedCount }, lang)}</span>
           {selectedCount > 1 && (
             <Btn variant="primary" small onClick={() => window.__goCompare && window.__goCompare()}>
-              开始对比 →
+              {t('startCompare', {}, lang)}
             </Btn>
           )}
           <Btn variant="subtle" small onClick={() => window.__clearCompare && window.__clearCompare()}
             style={{ background: '#333', color: '#ccc' }}>
-            清空
+            {t('clear', {}, lang)}
           </Btn>
         </div>
       )}
@@ -933,12 +1266,16 @@ const selectStyle = {
   color: '#1C1A17', cursor: 'pointer', outline: 'none',
 };
 
-const SORT_BASE = [
-  { key: 'time',  label: '创建时间' },
-  { key: 'epoch', label: 'Epoch 数' },
-];
+function getSortBase(lang) {
+  return [
+    { key: 'time',  label: t('sortTime', {}, lang) },
+    { key: 'epoch', label: t('sortEpoch', {}, lang) },
+  ];
+}
 
 function SortPicker({ sortKey, sortDir, onSort, onDir, sortableKeys, metrics, defaultKey, onSetDefault }) {
+  const lang = getLang();
+  const SORT_BASE = getSortBase(lang);
   const [open, setOpen]     = useState(false);
   const [query, setQuery]   = useState('');
   const [ctxMenu, setCtxMenu] = useState(null); // { x, y, itemKey, label }
@@ -973,7 +1310,7 @@ function SortPicker({ sortKey, sortDir, onSort, onDir, sortableKeys, metrics, de
   const matchOther = otherKeys.filter(k => !q || k.toLowerCase().includes(q));
 
   const currentLabel = SORT_BASE.find(i => i.key === sortKey)?.label || sortKey;
-  const defaultLabel = SORT_BASE.find(i => i.key === defaultKey)?.label || defaultKey || '时间';
+  const defaultLabel = SORT_BASE.find(i => i.key === defaultKey)?.label || defaultKey || t('sortTime', {}, lang);
 
   const pick = (key) => { onSort(key); setOpen(false); setQuery(''); };
 
@@ -1006,7 +1343,7 @@ function SortPicker({ sortKey, sortDir, onSort, onDir, sortableKeys, metrics, de
         onMouseLeave={e => { if (!active) e.currentTarget.style.background = 'transparent'; }}
       >
         <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-          {isDefault && <span title="默认排序" style={{ fontSize: 11, color: '#F59F00' }}>★</span>}
+          {isDefault && <span title={t('defaultSort', {}, lang)} style={{ fontSize: 11, color: '#F59F00' }}>★</span>}
           {label || itemKey}
         </span>
         {active && (
@@ -1014,7 +1351,7 @@ function SortPicker({ sortKey, sortDir, onSort, onDir, sortableKeys, metrics, de
             style={{ border: 'none', background: '#D6DCFF', color: '#4B6BFB',
               borderRadius: 4, padding: '1px 6px', fontSize: 12, cursor: 'pointer',
               fontFamily: 'inherit', fontWeight: 700 }}>
-            {sortDir === 'desc' ? '↓ 降序' : '↑ 升序'}
+            {sortDir === 'desc' ? '↓ DESC' : '↑ ASC'}
           </button>
         )}
       </div>
@@ -1029,7 +1366,7 @@ function SortPicker({ sortKey, sortDir, onSort, onDir, sortableKeys, metrics, de
         background: open ? '#F0F3FF' : '#fff',
         color: open ? '#4B6BFB' : '#1C1A17',
       }}>
-        <span>排序：{currentLabel}</span>
+        <span>{t('sortBy', { label: currentLabel }, lang)}</span>
         <span style={{ fontSize: 10, color: '#9D9890' }}>{sortDir === 'desc' ? '↓' : '↑'}</span>
         <span style={{ fontSize: 10 }}>▾</span>
       </button>
@@ -1055,7 +1392,7 @@ function SortPicker({ sortKey, sortDir, onSort, onDir, sortableKeys, metrics, de
             onMouseLeave={e => e.currentTarget.style.background = 'none'}
           >
             <span style={{ color: '#F59F00' }}>★</span>
-            {ctxMenu.itemKey === defaultKey ? '取消默认排序' : '设为默认排序'}
+            {ctxMenu.itemKey === defaultKey ? t('unsetDefaultSort', {}, lang) : t('setDefaultSort', {}, lang)}
           </button>
         </div>
       )}
@@ -1070,7 +1407,7 @@ function SortPicker({ sortKey, sortDir, onSort, onDir, sortableKeys, metrics, de
           {/* Search */}
           <div style={{ padding: '8px 8px 4px' }}>
             <input ref={input} value={query} onChange={e => setQuery(e.target.value)}
-              placeholder="搜索指标…"
+              placeholder={t('searchMetrics', {}, lang)}
               style={{ width: '100%', boxSizing: 'border-box', padding: '6px 10px',
                 borderRadius: 7, border: '1px solid #E4E1DA', fontSize: 12,
                 fontFamily: 'inherit', outline: 'none' }} />
@@ -1078,26 +1415,26 @@ function SortPicker({ sortKey, sortDir, onSort, onDir, sortableKeys, metrics, de
           {/* Default hint */}
           {defaultKey && (
             <div style={{ padding: '2px 12px 4px', fontSize: 11, color: '#B0A99E' }}>
-              默认排序：<span style={{ color: '#F59F00' }}>★</span> {defaultLabel}
+              {t('defaultSort', {}, lang)}: <span style={{ color: '#F59F00' }}>★</span> {defaultLabel}
             </div>
           )}
           {/* List */}
           <div style={{ overflowY: 'auto', paddingBottom: 6 }}>
             {matchBase.length > 0 && (<>
-              <SectionLabel>基础</SectionLabel>
+              <SectionLabel>{t('base', {}, lang)}</SectionLabel>
               {matchBase.map(i => <Item key={i.key} itemKey={i.key} label={i.label} />)}
             </>)}
             {matchTrain.length > 0 && (<>
-              <SectionLabel>训练指标</SectionLabel>
+              <SectionLabel>{t('trainMetrics', {}, lang)}</SectionLabel>
               {matchTrain.map(k => <Item key={k} itemKey={k} />)}
             </>)}
             {matchOther.length > 0 && (<>
-              <SectionLabel>其他指标</SectionLabel>
+              <SectionLabel>{t('otherMetrics', {}, lang)}</SectionLabel>
               {matchOther.map(k => <Item key={k} itemKey={k} />)}
             </>)}
             {matchBase.length + matchTrain.length + matchOther.length === 0 && (
               <div style={{ padding: '16px 12px', textAlign: 'center', fontSize: 12, color: '#B0A99E' }}>
-                无匹配指标
+                {t('noMatchingMetrics', {}, lang)}
               </div>
             )}
           </div>
@@ -1124,14 +1461,15 @@ function useFloatingPicker(inputRef) {
 }
 
 const BUILTIN_FIELDS = [
-  { key: 'tags',       label: '标签' },
-  { key: 'epoch',      label: 'Epoch' },
-  { key: 'epochCount', label: '本次 Epoch 数' },
-  { key: 'time',       label: '创建时间' },
-  { key: 'project',    label: '项目名' },
+  { key: 'tags',       labelZh: '标签', labelEn: 'Tags' },
+  { key: 'epoch',      labelZh: 'Epoch', labelEn: 'Epoch' },
+  { key: 'epochCount', labelZh: '本次 Epoch 数', labelEn: 'Epoch Count' },
+  { key: 'time',       labelZh: '创建时间', labelEn: 'Created Time' },
+  { key: 'project',    labelZh: '项目名', labelEn: 'Project' },
 ];
 
 function FieldPicker({ cardFields, onChangeFields, summaryKeys, configKeys }) {
+  const lang = getLang();
   const input = useRef(null);
   const { open, setOpen, query, setQuery, ref } = useFloatingPicker(input);
 
@@ -1140,8 +1478,9 @@ function FieldPicker({ cardFields, onChangeFields, summaryKeys, configKeys }) {
     onChangeFields(next);
   };
 
+  const localizedBuiltins = BUILTIN_FIELDS.map(f => ({ ...f, label: lang === 'en' ? f.labelEn : f.labelZh }));
   const q = query.toLowerCase();
-  const fBuiltin  = BUILTIN_FIELDS.filter(f => !q || f.label.includes(q) || f.key.includes(q));
+  const fBuiltin  = localizedBuiltins.filter(f => !q || f.label.toLowerCase().includes(q) || f.key.includes(q));
   const fSummary  = summaryKeys.filter(k => !q || k.toLowerCase().includes(q));
   const fConfig   = configKeys.filter(k => !q || k.toLowerCase().includes(q));
 
@@ -1182,7 +1521,7 @@ function FieldPicker({ cardFields, onChangeFields, summaryKeys, configKeys }) {
         background: open ? '#F0F3FF' : '#fff',
         color: open ? '#4B6BFB' : '#1C1A17',
       }}>
-        <span>显示字段</span>
+        <span>{t('showFields', {}, lang)}</span>
         <span style={{ background: '#4B6BFB', color: '#fff', borderRadius: 10,
           fontSize: 11, padding: '0 6px', fontWeight: 700 }}>{count}</span>
         <span style={{ fontSize: 10 }}>▾</span>
@@ -1197,38 +1536,38 @@ function FieldPicker({ cardFields, onChangeFields, summaryKeys, configKeys }) {
         }}>
           <div style={{ padding: '8px 8px 4px' }}>
             <input ref={input} value={query} onChange={e => setQuery(e.target.value)}
-              placeholder="搜索字段…"
+              placeholder={t('searchFields', {}, lang)}
               style={{ width: '100%', boxSizing: 'border-box', padding: '6px 10px',
                 borderRadius: 7, border: '1px solid #E4E1DA', fontSize: 12,
                 fontFamily: 'inherit', outline: 'none' }} />
           </div>
           <div style={{ overflowY: 'auto', paddingBottom: 6 }}>
             {fBuiltin.length > 0 && (<>
-              <SectionLabel>基础信息</SectionLabel>
+              <SectionLabel>{t('basicInfo', {}, lang)}</SectionLabel>
               {fBuiltin.map(f => <Item key={f.key} fieldKey={f.key} label={f.label} />)}
             </>)}
             {fSummary.length > 0 && (<>
-              <SectionLabel>Summary 指标</SectionLabel>
+              <SectionLabel>{t('summaryMetrics', {}, lang)}</SectionLabel>
               {fSummary.map(k => <Item key={k} fieldKey={k} />)}
             </>)}
             {fConfig.length > 0 && (<>
-              <SectionLabel>Config 参数</SectionLabel>
+              <SectionLabel>{t('configParams', {}, lang)}</SectionLabel>
               {fConfig.map(k => <Item key={k} fieldKey={k} />)}
             </>)}
             {fBuiltin.length + fSummary.length + fConfig.length === 0 && (
-              <div style={{ padding: 16, textAlign: 'center', fontSize: 12, color: '#B0A99E' }}>无匹配字段</div>
+              <div style={{ padding: 16, textAlign: 'center', fontSize: 12, color: '#B0A99E' }}>{t('noMatchingFields', {}, lang)}</div>
             )}
           </div>
           <div style={{ borderTop: '1px solid #F0EDE7', padding: '6px 8px', display: 'flex', gap: 6 }}>
             <button onClick={() => onChangeFields(BUILTIN_FIELDS.map(f => f.key))}
               style={{ flex: 1, padding: '5px 0', border: '1px solid #E4E1DA', borderRadius: 6,
                 background: '#fff', cursor: 'pointer', fontSize: 11, fontFamily: 'inherit', color: '#6B6560' }}>
-              重置
+              {t('reset', {}, lang)}
             </button>
             <button onClick={() => setOpen(false)}
               style={{ flex: 1, padding: '5px 0', border: 'none', borderRadius: 6,
                 background: '#4B6BFB', cursor: 'pointer', fontSize: 11, fontFamily: 'inherit', color: '#fff' }}>
-              完成
+              {t('done', {}, lang)}
             </button>
           </div>
         </div>
@@ -1237,7 +1576,8 @@ function FieldPicker({ cardFields, onChangeFields, summaryKeys, configKeys }) {
   );
 }
 
-function MultiSelectPicker({ label, selected, onChange, options, emptyText = '无选项' }) {
+function MultiSelectPicker({ label, selected, onChange, options, emptyText }) {
+  const lang = getLang();
   const inputRef = useRef(null);
   const { open, setOpen, query, setQuery, ref } = useFloatingPicker(inputRef);
 
@@ -1279,7 +1619,7 @@ function MultiSelectPicker({ label, selected, onChange, options, emptyText = '�
           {options.length > 5 && (
             <div style={{ padding: '8px 8px 4px' }}>
               <input ref={inputRef} value={query} onChange={e => setQuery(e.target.value)}
-                placeholder="搜索…"
+                placeholder={t('search', {}, lang)}
                 style={{ width: '100%', boxSizing: 'border-box', padding: '6px 10px',
                   borderRadius: 7, border: '1px solid #E4E1DA', fontSize: 12,
                   fontFamily: 'inherit', outline: 'none' }} />
@@ -1287,7 +1627,7 @@ function MultiSelectPicker({ label, selected, onChange, options, emptyText = '�
           )}
           <div style={{ overflowY: 'auto', paddingTop: 4, paddingBottom: 4 }}>
             {filtered.length === 0 ? (
-              <div style={{ padding: '12px 16px', textAlign: 'center', fontSize: 12, color: '#B0A99E' }}>{emptyText}</div>
+              <div style={{ padding: '12px 16px', textAlign: 'center', fontSize: 12, color: '#B0A99E' }}>{emptyText || t('noOptions', {}, lang)}</div>
             ) : filtered.map(o => {
               const on = selected.includes(o.key);
               return (
@@ -1316,7 +1656,7 @@ function MultiSelectPicker({ label, selected, onChange, options, emptyText = '�
               <button onClick={() => { onChange([]); setOpen(false); }}
                 style={{ width: '100%', padding: '5px 0', border: '1px solid #E4E1DA', borderRadius: 6,
                   background: '#fff', cursor: 'pointer', fontSize: 11, fontFamily: 'inherit', color: '#6B6560' }}>
-                清除筛选
+                {t('clearFilter', {}, lang)}
               </button>
             </div>
           )}
@@ -1336,6 +1676,7 @@ const LINE_COLORS = [
 ];
 
 function MetricChart({ history, metricKey, color = '#4B6BFB', label }) {
+  const lang = getLang();
   const canvasRef = useRef(null);
   const chartRef = useRef(null);
 
@@ -1371,7 +1712,7 @@ function MetricChart({ history, metricKey, color = '#4B6BFB', label }) {
           legend: { display: false },
           tooltip: {
             callbacks: {
-              title: items => `Epoch / Step: ${items[0].parsed.x}`,
+              title: items => `${lang === 'en' ? 'Epoch / Step' : 'Epoch / Step'}: ${items[0].parsed.x}`,
               label: item => `${metricKey}: ${item.parsed.y.toFixed(5)}`,
             },
           },
@@ -1394,14 +1735,15 @@ function MetricChart({ history, metricKey, color = '#4B6BFB', label }) {
     return () => { if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; } };
   }, [history, metricKey, color]);
 
-  if (!history.length) return <div style={{ color: '#9D9890', fontSize: 13, padding: 12 }}>暂无历史数据</div>;
+  if (!history.length) return <div style={{ color: '#9D9890', fontSize: 13, padding: 12 }}>{t('noHistory', {}, lang)}</div>;
   const hasMetric = history.some(h => h[metricKey] != null);
-  if (!hasMetric) return <div style={{ color: '#9D9890', fontSize: 13, padding: 12 }}>该 metric 无数据</div>;
+  if (!hasMetric) return <div style={{ color: '#9D9890', fontSize: 13, padding: 12 }}>{t('noMetricData', {}, lang)}</div>;
 
   return <div style={{ height: 220, position: 'relative' }}><canvas ref={canvasRef} /></div>;
 }
 
 function EditableField({ value, onSave, placeholder, multiline, style: s = {} }) {
+  const lang = getLang();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(value || '');
   useEffect(() => { setDraft(value || ''); }, [value]);
@@ -1427,7 +1769,7 @@ function EditableField({ value, onSave, placeholder, multiline, style: s = {} })
   return (
     <span
       onClick={() => setEditing(true)}
-      title="点击编辑"
+      title={t('clickToEdit', {}, lang)}
       style={{ cursor: 'text', borderBottom: '1.5px dashed #D1D5DB', ...s }}
     >
       {value || <span style={{ color: '#B0A99E', fontStyle: 'italic' }}>{placeholder}</span>}
@@ -1436,6 +1778,7 @@ function EditableField({ value, onSave, placeholder, multiline, style: s = {} })
 }
 
 function TagEditor({ tags, tagLib, onChangeTags, onChangeTagLib }) {
+  const lang = getLang();
   const [input, setInput] = useState('');
 
   const addTag = name => {
@@ -1460,7 +1803,7 @@ function TagEditor({ tags, tagLib, onChangeTags, onChangeTagLib }) {
         <input
           value={input} onChange={e => setInput(e.target.value)}
           onKeyDown={e => { if (e.key === 'Enter') { addTag(input); e.preventDefault(); } }}
-          placeholder="输入标签后按 Enter"
+          placeholder={t('tagInput', {}, lang)}
           style={{ padding: '5px 10px', borderRadius: 7, border: '1px solid #E4E1DA', fontSize: 13, fontFamily: 'inherit', outline: 'none', width: 160 }}
         />
         {suggestions.slice(0, 5).map(s => (
@@ -1475,6 +1818,7 @@ function TagEditor({ tags, tagLib, onChangeTags, onChangeTagLib }) {
 }
 
 function ConfigTable({ config, cmdArgs }) {
+  const lang = getLang();
   const [search, setSearch] = useState('');
   const [useCmd, setUseCmd] = useState(() => WBStore.getUseCommandArgs('_global'));
   const hasCmdArgs = cmdArgs && Object.keys(cmdArgs).length > 0;
@@ -1498,7 +1842,7 @@ function ConfigTable({ config, cmdArgs }) {
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10, flexWrap: 'wrap' }}>
         <input
           value={search} onChange={e => setSearch(e.target.value)}
-          placeholder="搜索参数…"
+          placeholder={t('searchParams', {}, lang)}
           style={{ flex: 1, minWidth: 120, padding: '6px 10px', borderRadius: 7, border: '1px solid #E4E1DA', fontSize: 13, fontFamily: 'inherit', outline: 'none' }}
         />
         {hasCmdArgs && (
@@ -1506,14 +1850,14 @@ function ConfigTable({ config, cmdArgs }) {
             <input type="checkbox" checked={useCmd} onChange={e => handleToggle(e.target.checked)}
               style={{ width: 13, height: 13, accentColor: '#4B6BFB', cursor: 'pointer' }} />
             <span style={{ fontSize: 12, color: '#6B6560' }}>
-              合并 Command 参数
-              <span style={{ marginLeft: 4, fontSize: 11, color: '#9D9890' }}>（{Object.keys(cmdArgs).length} 项）</span>
+              {t('mergeCommandArgs', {}, lang)}
+              <span style={{ marginLeft: 4, fontSize: 11, color: '#9D9890' }}>{lang === 'en' ? `(${Object.keys(cmdArgs).length} items)` : `（${Object.keys(cmdArgs).length} 项）`}</span>
             </span>
           </label>
         )}
       </div>
       <div style={{ borderRadius: 8, border: '1px solid #E4E1DA', overflow: 'hidden' }}>
-        {entries.length === 0 ? <div style={{ padding: 16, color: '#9D9890', fontSize: 13 }}>无匹配参数</div> :
+        {entries.length === 0 ? <div style={{ padding: 16, color: '#9D9890', fontSize: 13 }}>{t('noMatchingParams', {}, lang)}</div> :
           entries.map(([k, v], i) => {
             const fromCmd = useCmd && cmdKeys.has(k) && !(k in config);
             return (
@@ -1537,6 +1881,7 @@ function ConfigTable({ config, cmdArgs }) {
 }
 
 function DetailPage({ run, meta, tagLib, onToggleFav, onSaveMeta, onChangeTagLib, onBack, settings }) {
+  const lang = getLang();
   const [history, setHistory] = useState([]);
   const [histLoading, setHistLoading] = useState(false);
   const [activeTab, setActiveTab] = useState('charts');
@@ -1554,7 +1899,7 @@ function DetailPage({ run, meta, tagLib, onToggleFav, onSaveMeta, onChangeTagLib
     const summaryKeys = Object.keys(run.summary || {}).filter(k => !k.startsWith('_') && typeof (run.summary||{})[k] === 'number');
     WBApi.loadHistory(apiKey, entity, project, run.name, 500, summaryKeys)
       .then(setHistory)
-      .catch(err => { alert('历史数据加载失败：' + err.message); setHistory([]); })
+      .catch(err => { alert(t('historyLoadFailed', { error: err.message }, lang)); setHistory([]); })
       .finally(() => setHistLoading(false));
   }, [run.name]);
 
@@ -1613,7 +1958,14 @@ function DetailPage({ run, meta, tagLib, onToggleFav, onSaveMeta, onChangeTagLib
   }, [activeTab]);
 
   const tabs = ['charts', 'logs', 'overview', 'trainconfig', 'config', 'summary'];
-  const tabLabels = { charts: '训练曲线', logs: 'Logs', overview: '概览', trainconfig: '训练配置', config: 'Config', summary: 'Summary' };
+  const tabLabels = {
+    charts: t('detailCharts', {}, lang),
+    logs: 'Logs',
+    overview: t('detailOverview', {}, lang),
+    trainconfig: t('detailTrainConfig', {}, lang),
+    config: 'Config',
+    summary: 'Summary',
+  };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
@@ -1646,11 +1998,11 @@ function DetailPage({ run, meta, tagLib, onToggleFav, onSaveMeta, onChangeTagLib
 
       {/* Notes */}
       <div style={{ padding: '10px 16px', borderBottom: '1px solid #E4E1DA', background: '#fff', flexShrink: 0 }}>
-        <div style={{ fontSize: 11, color: '#9D9890', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.05em' }}>备注</div>
+        <div style={{ fontSize: 11, color: '#9D9890', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{t('detailNotes', {}, lang)}</div>
         <EditableField
           value={meta.note}
           onSave={v => onSaveMeta({ note: v })}
-          placeholder="点击添加备注…"
+          placeholder={t('addNote', {}, lang)}
           multiline
           style={{ fontSize: 13, color: '#1C1A17', display: 'block', width: '100%' }}
         />
@@ -1678,7 +2030,7 @@ function DetailPage({ run, meta, tagLib, onToggleFav, onSaveMeta, onChangeTagLib
               {[1,2].map(i => <Skeleton key={i} height={220} radius={8} />)}
             </div>
           ) : history.length === 0 ? (
-            <EmptyState icon="📈" title="暂无训练曲线数据" desc="历史数据未能加载，请检查 API 配置" />
+            <EmptyState icon="📈" title={t('noChartData', {}, lang)} desc={t('chartDataHint', {}, lang)} />
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
               {/* Metric selector */}
@@ -1705,7 +2057,7 @@ function DetailPage({ run, meta, tagLib, onToggleFav, onSaveMeta, onChangeTagLib
                 </div>
               ))}
               {visibleMetrics.length === 0 && (
-                <div style={{ textAlign: 'center', color: '#9D9890', fontSize: 13, padding: 40 }}>请在上方选择要显示的指标</div>
+                <div style={{ textAlign: 'center', color: '#9D9890', fontSize: 13, padding: 40 }}>{t('selectMetricsHint', {}, lang)}</div>
               )}
             </div>
           )
@@ -1717,17 +2069,17 @@ function DetailPage({ run, meta, tagLib, onToggleFav, onSaveMeta, onChangeTagLib
           ) : logsError ? (
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, padding: 40 }}>
               <div style={{ fontSize: 13, color: '#E03131' }}>{logsError}</div>
-              <button onClick={fetchLogs} style={{ padding: '6px 16px', borderRadius: 7, border: '1px solid #E4E1DA', background: '#fff', cursor: 'pointer', fontSize: 13, fontFamily: 'inherit' }}>重试</button>
+              <button onClick={fetchLogs} style={{ padding: '6px 16px', borderRadius: 7, border: '1px solid #E4E1DA', background: '#fff', cursor: 'pointer', fontSize: 13, fontFamily: 'inherit' }}>{t('retry', {}, lang)}</button>
             </div>
           ) : logs === null ? (
-            <EmptyState icon="📋" title="暂无日志" desc="点击加载获取运行日志" />
+            <EmptyState icon="📋" title={t('noLogs', {}, lang)} desc={t('loadLogsHint', {}, lang)} />
           ) : logs.trim() === '' ? (
-            <EmptyState icon="📋" title="日志为空" desc="该 run 的 output.log 没有内容" />
+            <EmptyState icon="📋" title={t('emptyLogs', {}, lang)} desc={t('emptyLogsHint', {}, lang)} />
           ) : (
             <div style={{ position: 'relative' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                <span style={{ fontSize: 11, color: '#9D9890' }}>{logs.split('\n').length} 行</span>
-                <button onClick={fetchLogs} style={{ border: 'none', background: 'none', cursor: 'pointer', fontSize: 12, color: '#4B6BFB', fontFamily: 'inherit' }}>刷新</button>
+                <span style={{ fontSize: 11, color: '#9D9890' }}>{t('lines', { count: logs.split('\n').length }, lang)}</span>
+                <button onClick={fetchLogs} style={{ border: 'none', background: 'none', cursor: 'pointer', fontSize: 12, color: '#4B6BFB', fontFamily: 'inherit' }}>{t('refresh', {}, lang)}</button>
               </div>
               <div ref={logsRef} style={{
                 background: '#1C1A17', color: '#E8E4DE', borderRadius: 8,
@@ -1741,7 +2093,7 @@ function DetailPage({ run, meta, tagLib, onToggleFav, onSaveMeta, onChangeTagLib
                 style={{ position: 'absolute', bottom: 12, right: 12, border: 'none',
                   background: 'rgba(75,107,251,0.85)', color: '#fff', borderRadius: 20,
                   padding: '4px 12px', fontSize: 12, cursor: 'pointer', fontFamily: 'inherit' }}>
-                ↓ 底部
+                {t('bottom', {}, lang)}
               </button>
             </div>
           )
@@ -1758,15 +2110,15 @@ function DetailPage({ run, meta, tagLib, onToggleFav, onSaveMeta, onChangeTagLib
             meta.os && { label: 'OS', value: meta.os },
             meta.python && { label: 'Python', value: meta.python },
             meta.gpu && { label: 'GPU', value: `${meta.gpu}${meta.gpuCount > 1 ? ` × ${meta.gpuCount}` : ''}` },
-            meta.gpuCount && !meta.gpu && { label: 'GPU Count', value: String(meta.gpuCount) },
+            meta.gpuCount && !meta.gpu && { label: lang === 'en' ? 'GPU Count' : 'GPU 数量', value: String(meta.gpuCount) },
             meta.cpu && { label: 'CPU', value: meta.cpu },
             meta.git?.commit && { label: 'Git Commit', value: meta.git.commit, mono: true },
             meta.git?.remote && { label: 'Git Remote', value: meta.git.remote, mono: true },
-            meta.codeSaved != null && { label: 'Code Saved', value: meta.codeSaved ? '是' : '否' },
-            run.heartbeatAt && { label: '最后心跳', value: new Date(run.heartbeatAt).toLocaleString() },
+            meta.codeSaved != null && { label: 'Code Saved', value: meta.codeSaved ? (lang === 'en' ? 'Yes' : '是') : (lang === 'en' ? 'No' : '否') },
+            run.heartbeatAt && { label: lang === 'en' ? 'Last heartbeat' : '最后心跳', value: new Date(run.heartbeatAt).toLocaleString(lang === 'en' ? 'en-US' : 'zh-CN') },
           ].filter(Boolean);
 
-          if (!rows.length) return <EmptyState icon="ℹ️" title="无概览数据" desc="该 run 未上传 metadata" />;
+          if (!rows.length) return <EmptyState icon="ℹ️" title={t('noOverview', {}, lang)} desc={t('noOverviewHint', {}, lang)} />;
 
           return (
             <div style={{ borderRadius: 8, border: '1px solid #E4E1DA', overflow: 'hidden' }}>
@@ -1796,7 +2148,7 @@ function DetailPage({ run, meta, tagLib, onToggleFav, onSaveMeta, onChangeTagLib
           const cmdArgs = WBStore.getCommandArgs(run.name);
           const isEmpty = Object.keys(config).length === 0 && (!cmdArgs || Object.keys(cmdArgs).length === 0);
           return isEmpty
-            ? <EmptyState icon="⚙️" title="无 Config 数据" />
+            ? <EmptyState icon="⚙️" title={t('noConfig', {}, lang)} />
             : <ConfigTable config={config} cmdArgs={cmdArgs} />;
         })()}
 
@@ -1829,6 +2181,7 @@ const { useState, useEffect, useRef, useMemo } = React;
 const COMPARE_COLORS = ['#4B6BFB','#F59E0B','#10B981','#EF4444','#8B5CF6'];
 
 function OverlayChart({ datasets, metricKey }) {
+  const lang = getLang();
   const canvasRef = useRef(null);
   const chartRef = useRef(null);
 
@@ -1874,7 +2227,7 @@ function OverlayChart({ datasets, metricKey }) {
           },
           tooltip: {
             callbacks: {
-              title: items => `Step / Epoch: ${items[0].parsed.x}`,
+              title: items => `${lang === 'en' ? 'Step / Epoch' : 'Step / Epoch'}: ${items[0].parsed.x}`,
             },
           },
         },
@@ -1900,6 +2253,7 @@ function OverlayChart({ datasets, metricKey }) {
 }
 
 function ParamDiffTable({ runs, allConfigs }) {
+  const lang = getLang();
   const [showSame, setShowSame] = useState(false);
   const [search, setSearch] = useState('');
 
@@ -1928,26 +2282,26 @@ function ParamDiffTable({ runs, allConfigs }) {
       <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 12, flexWrap: 'wrap' }}>
         <input
           value={search} onChange={e => setSearch(e.target.value)}
-          placeholder="搜索参数…"
+          placeholder={t('searchParams', {}, lang)}
           style={{ padding: '6px 10px', borderRadius: 7, border: '1px solid #E4E1DA', fontSize: 13, fontFamily: 'inherit', outline: 'none', flex: 1, minWidth: 140 }}
         />
         <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, color: '#6B6560', cursor: 'pointer', userSelect: 'none' }}>
           <input type="checkbox" checked={showSame} onChange={e => setShowSame(e.target.checked)} style={{ accentColor: '#4B6BFB' }} />
-          显示相同参数
+          {t('showSame', {}, lang)}
         </label>
-        {!showSame && <span style={{ fontSize: 12, color: '#9D9890' }}>只显示差异</span>}
+        {!showSame && <span style={{ fontSize: 12, color: '#9D9890' }}>{t('onlyDiff', {}, lang)}</span>}
       </div>
 
       {rows.length === 0 ? (
         <div style={{ color: '#9D9890', fontSize: 13, padding: 16, textAlign: 'center' }}>
-          {showSame ? '无参数' : '所有参数相同'}
+          {showSame ? t('noParams', {}, lang) : t('allSame', {}, lang)}
         </div>
       ) : (
         <div style={{ overflowX: 'auto' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
             <thead>
               <tr style={{ background: '#F3F2EF' }}>
-                <th style={thStyle}>参数</th>
+                <th style={thStyle}>{t('param', {}, lang)}</th>
                 {runs.map((r, i) => {
                   const alias = (WBStore.getMeta(r.name) || {}).alias || r.displayName || r.name;
                   return (
@@ -1974,6 +2328,7 @@ function ParamDiffTable({ runs, allConfigs }) {
 }
 
 function SummaryRow({ runs }) {
+  const lang = getLang();
   const keys = useMemo(() => {
     const s = new Set();
     runs.forEach(r => Object.keys(r.summary || {}).filter(k => !k.startsWith('_')).forEach(k => s.add(k)));
@@ -1987,7 +2342,7 @@ function SummaryRow({ runs }) {
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
         <thead>
           <tr style={{ background: '#F3F2EF' }}>
-            <th style={thStyle}>Metric</th>
+            <th style={thStyle}>{t('metric', {}, lang)}</th>
             {runs.map((r, i) => {
               const alias = (WBStore.getMeta(r.name) || {}).alias || r.displayName || r.name;
               return <th key={r.name} style={{ ...thStyle, color: COMPARE_COLORS[i] }}>{alias}</th>;
@@ -2015,6 +2370,7 @@ function SummaryRow({ runs }) {
 }
 
 function ComparePage({ runs, onBack, onOpenRun, settings }) {
+  const lang = getLang();
   const [histories, setHistories] = useState({});
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('charts');
@@ -2070,7 +2426,12 @@ function ComparePage({ runs, onBack, onOpenRun, settings }) {
   }));
 
   const tabs = ['charts', 'params', 'trainconfig', 'summary'];
-  const tabLabels = { charts: '曲线对比', params: '参数差异', trainconfig: '配置对比', summary: 'Summary 对比' };
+  const tabLabels = {
+    charts: t('compareCharts', {}, lang),
+    params: t('compareParams', {}, lang),
+    trainconfig: t('compareTrainConfig', {}, lang),
+    summary: t('compareSummary', {}, lang),
+  };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
@@ -2078,7 +2439,7 @@ function ComparePage({ runs, onBack, onOpenRun, settings }) {
       <div style={{ padding: '12px 16px', borderBottom: '1px solid #E4E1DA', background: '#FAFAF8', flexShrink: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
           <button onClick={onBack} style={{ border: 'none', background: 'none', cursor: 'pointer', fontSize: 20, color: '#6B6560', padding: '0 4px' }}>←</button>
-          <span style={{ fontWeight: 700, fontSize: 16 }}>对比 {runs.length} 条训练</span>
+          <span style={{ fontWeight: 700, fontSize: 16 }}>{t('compareRuns', { count: runs.length }, lang)}</span>
         </div>
         {/* Run color legend — click to open detail */}
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
@@ -2086,7 +2447,7 @@ function ComparePage({ runs, onBack, onOpenRun, settings }) {
             const alias = (WBStore.getMeta(r.name) || {}).alias || r.displayName || r.name;
             return (
               <button key={r.name} onClick={() => onOpenRun && onOpenRun(r)}
-                title="点击查看详情"
+                title={t('openDetail', {}, lang)}
                 style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13,
                   border: '1px solid', borderColor: COMPARE_COLORS[i] + '55',
                   borderRadius: 20, padding: '3px 10px 3px 8px',
@@ -2152,7 +2513,7 @@ function ComparePage({ runs, onBack, onOpenRun, settings }) {
                 </div>
               ))}
               {!(selectedMetrics || []).length && (
-                <EmptyState icon="📊" title="请在上方选择要对比的指标" />
+                <EmptyState icon="📊" title={t('selectCompareMetrics', {}, lang)} />
               )}
             </div>
           )
@@ -2168,7 +2529,7 @@ function ComparePage({ runs, onBack, onOpenRun, settings }) {
           });
           const hasAny = customConfigs.some(c => Object.keys(c).length > 0);
           if (!hasAny) return (
-            <EmptyState icon="📄" title="暂无训练配置" desc="请在各训练详情页的「训练配置」tab 中粘贴 JSON 后再对比" />
+            <EmptyState icon="📄" title={t('noTrainConfig', {}, lang)} desc={t('noTrainConfigHint', {}, lang)} />
           );
           return <ParamDiffTable runs={runs} allConfigs={customConfigs} />;
         })()}
@@ -2188,8 +2549,9 @@ Object.assign(window, { ComparePage });
 const { useState, useEffect, useCallback, useMemo } = React;
 
 // ─── Settings Page ────────────────────────────────────────────────────────────
-function SettingsPage({ onSaved }) {
+function SettingsPage({ onSaved, onLanguageChange }) {
   const init = WBStore.getSettings();
+  const [language, setLanguage] = useState(init.language === 'en' ? 'en' : 'zh');
   const [apiKey,   setApiKey]   = useState(init.apiKey   || '');
   const [entity,   setEntity]   = useState(init.entity   || '');
   const [projects, setProjects] = useState((init.projects || []).join(', '));
@@ -2198,42 +2560,50 @@ function SettingsPage({ onSaved }) {
   const [customProxy, setCustomProxy] = useState(init.customProxy || '');
   const [testing,  setTesting]  = useState(false);
   const [testMsg,  setTestMsg]  = useState('');
-  const [copied,   setCopied]   = useState('');
+  const [projectList, setProjectList] = useState([]);
+  const [loadingProj, setLoadingProj] = useState(false);
+
+  const handleLanguageChange = (next) => {
+    setLanguage(next);
+    WBStore.saveSettings({ language: next });
+    onLanguageChange?.(next);
+  };
 
   const save = async (andTest) => {
     const projectList = projects.split(',').map(s => s.trim()).filter(Boolean);
     const metricList  = metrics.split(',').map(s => s.trim()).filter(Boolean);
-    WBStore.saveSettings({ apiKey: apiKey.trim(), entity: entity.trim(), projects: projectList, metrics: metricList, minEpoch: Number(minEpoch), customProxy: customProxy.trim() });
+    WBStore.saveSettings({
+      language,
+      apiKey: apiKey.trim(),
+      entity: entity.trim(),
+      projects: projectList,
+      metrics: metricList,
+      minEpoch: Number(minEpoch),
+      customProxy: customProxy.trim()
+    });
     if (!andTest) { onSaved(); return; }
     if (!apiKey.trim() || !entity.trim() || !projectList.length) {
-      setTestMsg('请填写完整配置'); return;
+      setTestMsg(t('fillConfig', {}, language)); return;
     }
     setTesting(true); setTestMsg('');
     try {
       await WBApi.testConnection(apiKey.trim(), entity.trim(), projectList[0], null, customProxy.trim());
-      setTestMsg('✅ 连接成功！');
+      setTestMsg(t('testSuccess', {}, language));
       setTimeout(onSaved, 800);
     } catch (e) {
       setTestMsg('❌ ' + e.message);
     } finally { setTesting(false); }
   };
 
-  const copyText = (key, text) => {
-    navigator.clipboard.writeText(text).then(() => { setCopied(key); setTimeout(() => setCopied(''), 1800); });
-  };
-
-  const [projectList, setProjectList] = useState([]);
-  const [loadingProj, setLoadingProj] = useState(false);
-
   const browseProjects = async () => {
-    if (!apiKey.trim() || !entity.trim()) { alert('请先填写 API Key 和 Entity'); return; }
+    if (!apiKey.trim() || !entity.trim()) { alert(t('fillApiEntity', {}, language)); return; }
     setLoadingProj(true);
     try {
       const list = await WBApi.listProjects(apiKey.trim(), entity.trim(), null, customProxy.trim());
       setProjectList(list);
-      if (list.length === 0) alert('未找到任何项目，请检查 Entity 名称');
+      if (list.length === 0) alert(t('noProjectsFound', {}, language));
     } catch (e) {
-      alert('获取项目列表失败：' + e.message);
+      alert(t('fetchProjectsFailed', { error: e.message }, language));
     } finally { setLoadingProj(false); }
   };
 
@@ -2245,14 +2615,22 @@ function SettingsPage({ onSaved }) {
   return (
     <div style={{ maxWidth: 540, margin: '0 auto', padding: '28px 20px 60px', height: '100%', overflowY: 'auto', WebkitOverflowScrolling: 'touch', boxSizing: 'border-box', width: '100%' }}>
       <div style={{ marginBottom: 22 }}>
-        <div style={{ fontSize: 21, fontWeight: 800, color: '#1C1A17', marginBottom: 3 }}>W&amp;B 日志管理</div>
-        <div style={{ fontSize: 13, color: '#9D9890' }}>连接你的 Weights &amp; Biases 训练数据</div>
+        <div style={{ fontSize: 21, fontWeight: 800, color: '#1C1A17', marginBottom: 3 }}>{t('appTitle', {}, language)}</div>
+        <div style={{ fontSize: 13, color: '#9D9890' }}>{t('connectSubtitle', {}, language)}</div>
       </div>
 
       {(<>
+        <div style={{ marginBottom: 14 }}>
+          <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#6B6560', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.04em' }}>{t('language', {}, language)}</label>
+          <select value={language} onChange={e => handleLanguageChange(e.target.value)}
+            style={{ width: '100%', boxSizing: 'border-box', padding: '9px 12px', borderRadius: 8, border: '1px solid #E4E1DA', fontSize: 14, background: '#fff', fontFamily: 'inherit', outline: 'none' }}>
+            <option value="zh">{t('chinese', {}, language)}</option>
+            <option value="en">{t('english', {}, language)}</option>
+          </select>
+        </div>
         {[
-          { label: 'API Key', value: apiKey, set: setApiKey, type: 'password', placeholder: '粘贴你的 W&B API Key' },
-          { label: 'Entity（用户名 / 团队）', value: entity, set: setEntity, placeholder: 'your-username' },
+          { label: 'API Key', value: apiKey, set: setApiKey, type: 'password', placeholder: t('pasteApiKey', {}, language) },
+          { label: t('entityLabel', {}, language), value: entity, set: setEntity, placeholder: 'your-username' },
         ].map(({ label, value, set, type, placeholder }) => (
           <div key={label} style={{ marginBottom: 14 }}>
             <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#6B6560', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.04em' }}>{label}</label>
@@ -2266,11 +2644,11 @@ function SettingsPage({ onSaved }) {
         {/* Projects field with browse */}
         <div style={{ marginBottom: 14 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 5 }}>
-            <label style={{ fontSize: 11, fontWeight: 600, color: '#6B6560', textTransform: 'uppercase', letterSpacing: '0.04em' }}>Projects（多个用逗号分隔）</label>
+            <label style={{ fontSize: 11, fontWeight: 600, color: '#6B6560', textTransform: 'uppercase', letterSpacing: '0.04em' }}>{t('projectsLabel', {}, language)}</label>
             <button onClick={browseProjects} disabled={loadingProj} style={{
               border: 'none', background: 'none', cursor: 'pointer', color: '#4B6BFB',
               fontSize: 12, padding: 0, fontFamily: 'inherit', fontWeight: 500,
-            }}>{loadingProj ? '加载中…' : '浏览所有项目 →'}</button>
+            }}>{loadingProj ? t('loading', {}, language) : t('browseProjects', {}, language)}</button>
           </div>
           <input value={projects} onChange={e => setProjects(e.target.value)} placeholder="project-a, project-b"
             style={{ width: '100%', boxSizing: 'border-box', padding: '9px 12px', borderRadius: 8, border: '1px solid #E4E1DA', fontSize: 14, fontFamily: 'inherit', outline: 'none', background: '#fff', color: '#1C1A17' }}
@@ -2298,7 +2676,7 @@ function SettingsPage({ onSaved }) {
         </div>
 
         {[
-          { label: '关注的 Metrics（逗号分隔）', value: metrics, set: setMetrics, placeholder: 'train_loss, val_loss' },
+          { label: t('metricsLabel', {}, language), value: metrics, set: setMetrics, placeholder: 'train_loss, val_loss' },
         ].map(({ label, value, set, type, placeholder }) => (
           <div key={label} style={{ marginBottom: 14 }}>
             <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#6B6560', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.04em' }}>{label}</label>
@@ -2310,40 +2688,42 @@ function SettingsPage({ onSaved }) {
         ))}
 
         <div style={{ marginBottom: 16 }}>
-          <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#6B6560', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.04em' }}>最少 Epoch 数</label>
+          <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#6B6560', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.04em' }}>{t('minEpochLabel', {}, language)}</label>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             <input type="number" min={1} max={100} value={minEpoch} onChange={e => setMinEpoch(e.target.value)}
               style={{ width: 72, padding: '9px 12px', borderRadius: 8, border: '1px solid #E4E1DA', fontSize: 14, fontFamily: 'inherit', outline: 'none' }} />
-            <span style={{ fontSize: 13, color: '#9D9890' }}>过滤本次训练不足 {minEpoch} 个 epoch 的记录</span>
+            <span style={{ fontSize: 13, color: '#9D9890' }}>{t('minEpochHint', { count: minEpoch }, language)}</span>
           </div>
         </div>
 
       <div style={{ marginBottom: 18, padding: 12, background: '#F9F8F5', borderRadius: 8, border: '1px solid #E4E1DA' }}>
         <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#4B6BFB', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-          本地代理地址
+          {t('proxyLabel', {}, language)}
         </label>
         <input value={customProxy} onChange={e => setCustomProxy(e.target.value)}
           placeholder="http://localhost:8080"
           style={{ width: '100%', boxSizing: 'border-box', padding: '8px 10px', borderRadius: 7, border: '1px solid #E4E1DA', fontSize: 13, fontFamily: 'monospace', outline: 'none', background: '#fff' }} />
         <div style={{ marginTop: 8, fontSize: 12, color: '#6B6560', lineHeight: 1.7 }}>
-          需先在本地运行代理脚本以解决浏览器 CORS 限制：
+          {t('proxyHint', {}, language)}
           <pre style={{ margin: '6px 0 0', padding: '6px 10px', background: '#1C1A17', color: '#E8E4DE',
             borderRadius: 6, fontSize: 12, fontFamily: 'monospace', display: 'inline-block' }}>
             python proxy.py</pre>
-          <span style={{ marginLeft: 8, color: '#9D9890', fontSize: 11 }}>（随项目附带，无需额外安装）</span>
+          <span style={{ marginLeft: 8, color: '#9D9890', fontSize: 11 }}>{t('bundledProxy', {}, language)}</span>
         </div>
       </div>
 
         <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
           <Btn onClick={() => save(true)} disabled={testing}>
-          {testing ? '测试中…' : '测试并保存'}
+          {testing ? t('testing', {}, language) : t('testAndSave', {}, language)}
         </Btn>
-        <Btn variant="subtle" onClick={() => save(false)}>直接保存</Btn>
+        <Btn variant="subtle" onClick={() => save(false)}>{t('saveDirectly', {}, language)}</Btn>
         {testMsg && <span style={{ fontSize: 13, color: testMsg.startsWith('✅') ? '#15803D' : '#DC2626' }}>{testMsg}</span>}
       </div>
 
       <div style={{ marginTop: 20, padding: 12, background: '#F3F2EF', borderRadius: 8, fontSize: 12, color: '#9D9890', lineHeight: 1.6 }}>
-        <strong style={{ color: '#6B6560' }}>提示：</strong>API Key 可在 <a href="https://wandb.ai/settings" target="_blank" rel="noreferrer" style={{ color: '#4B6BFB' }}>wandb.ai/settings</a> 获取。数据仅存于本地浏览器。
+        <strong style={{ color: '#6B6560' }}>{t('settingsTip', {}, language)}</strong> {language === 'en' ? 'Get your API key at ' : 'API Key 可在 '}
+        <a href="https://wandb.ai/settings" target="_blank" rel="noreferrer" style={{ color: '#4B6BFB' }}>wandb.ai/settings</a>
+        {language === 'en' ? '. Data stays only in your local browser.' : ' 获取。数据仅存于本地浏览器。'}
       </div>
     </>)}
     </div>
@@ -2352,21 +2732,22 @@ function SettingsPage({ onSaved }) {
 
 // ─── Nav ──────────────────────────────────────────────────────────────────────
 const NAV_ITEMS = [
-  { key: 'list',     icon: '📋', label: '训练列表' },
-  { key: 'favs',     icon: '⭐', label: '收藏'     },
-  { key: 'compare',  icon: '📊', label: '对比'     },
-  { key: 'settings', icon: '⚙️', label: '设置'     },
+  { key: 'list',     icon: '📋', labelKey: 'runList' },
+  { key: 'favs',     icon: '⭐', labelKey: 'favorites' },
+  { key: 'compare',  icon: '📊', labelKey: 'compare' },
+  { key: 'settings', icon: '⚙️', labelKey: 'settings' },
 ];
 
 function Sidebar({ page, onNav, compareCount }) {
+  const lang = getLang();
   return (
     <div style={{ width: 200, borderRight: '1px solid #E4E1DA', background: '#FAFAF8', display: 'flex', flexDirection: 'column', flexShrink: 0 }}>
       <div style={{ padding: '20px 16px 12px', borderBottom: '1px solid #E4E1DA' }}>
         <div style={{ fontWeight: 800, fontSize: 17, color: '#1C1A17', letterSpacing: '-0.02em' }}>W&amp;B Logs</div>
-        <div style={{ fontSize: 11, color: '#B0A99E', marginTop: 2 }}>训练日志管理</div>
+        <div style={{ fontSize: 11, color: '#B0A99E', marginTop: 2 }}>{t('appSubtitle', {}, lang)}</div>
       </div>
       <nav style={{ flex: 1, padding: '10px 8px' }}>
-        {NAV_ITEMS.map(({ key, icon, label }) => (
+        {NAV_ITEMS.map(({ key, icon, labelKey }) => (
           <button key={key} onClick={() => onNav(key)} style={{
             display: 'flex', alignItems: 'center', gap: 10,
             width: '100%', padding: '9px 12px', borderRadius: 8,
@@ -2378,7 +2759,7 @@ function Sidebar({ page, onNav, compareCount }) {
             transition: 'background 0.12s',
           }}>
             <span style={{ fontSize: 16 }}>{icon}</span>
-            <span style={{ flex: 1 }}>{label}</span>
+            <span style={{ flex: 1 }}>{t(labelKey, {}, lang)}</span>
             {key === 'compare' && compareCount > 0 && (
               <span style={{ background: '#4B6BFB', color: '#fff', borderRadius: 10, fontSize: 11, padding: '1px 6px', fontWeight: 700 }}>{compareCount}</span>
             )}
@@ -2390,9 +2771,10 @@ function Sidebar({ page, onNav, compareCount }) {
 }
 
 function BottomNav({ page, onNav, compareCount }) {
+  const lang = getLang();
   return (
     <div style={{ display: 'flex', borderTop: '1px solid #E4E1DA', background: '#FAFAF8', flexShrink: 0 }}>
-      {NAV_ITEMS.map(({ key, icon, label }) => (
+      {NAV_ITEMS.map(({ key, icon, labelKey }) => (
         <button key={key} onClick={() => onNav(key)} style={{
           flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center',
           padding: '8px 4px', border: 'none',
@@ -2401,7 +2783,7 @@ function BottomNav({ page, onNav, compareCount }) {
           cursor: 'pointer', fontFamily: 'inherit', position: 'relative',
         }}>
           <span style={{ fontSize: 20, lineHeight: 1.2 }}>{icon}</span>
-          <span style={{ fontSize: 10, fontWeight: page === key ? 600 : 400, marginTop: 2 }}>{label}</span>
+          <span style={{ fontSize: 10, fontWeight: page === key ? 600 : 400, marginTop: 2 }}>{t(labelKey, {}, lang)}</span>
           {key === 'compare' && compareCount > 0 && (
             <span style={{ position: 'absolute', top: 6, right: '50%', transform: 'translateX(8px)', background: '#4B6BFB', color: '#fff', borderRadius: 10, fontSize: 10, padding: '0 5px', fontWeight: 700 }}>{compareCount}</span>
           )}
@@ -2413,6 +2795,7 @@ function BottomNav({ page, onNav, compareCount }) {
 
 // ─── Root App ─────────────────────────────────────────────────────────────────
 function App() {
+  const [settingsVersion, setSettingsVersion] = useState(0);
   const [page, setPage]               = useState('list');
   const [runs, setRuns]               = useState([]);
   const [allMeta, setAllMeta]         = useState(WBStore.getAllMeta());
@@ -2424,7 +2807,8 @@ function App() {
   const [detailRun, setDetailRun]     = useState(null);
   const [isMobile, setIsMobile]       = useState(window.innerWidth < 768);
 
-  const settings = WBStore.getSettings();
+  const settings = useMemo(() => WBStore.getSettings(), [settingsVersion]);
+  const lang = settings.language === 'en' ? 'en' : 'zh';
   const hasConfig = !!(settings.apiKey && settings.entity && settings.projects?.length);
 
   useEffect(() => {
@@ -2432,6 +2816,11 @@ function App() {
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
   }, []);
+
+  useEffect(() => {
+    document.documentElement.lang = lang === 'en' ? 'en' : 'zh-CN';
+    document.title = t('appTitle', {}, lang);
+  }, [lang]);
 
   const refreshMeta = useCallback(() => setAllMeta(WBStore.getAllMeta()), []);
   const refreshTagLib = useCallback(lib => setTagLib(lib || WBStore.getTagLib()), []);
@@ -2441,8 +2830,8 @@ function App() {
     if (!s.apiKey || !s.entity || !s.projects?.length) return;
     setLoading(true); setError('');
     try {
-      const raw = await WBApi.loadAllRunsMulti(s.apiKey, s.entity, s.projects, (n, t, proj) => {
-        setLoadMsg(`加载中 ${proj}… ${n}/${t}`);
+      const raw = await WBApi.loadAllRunsMulti(s.apiKey, s.entity, s.projects, (current, total, proj) => {
+        setLoadMsg(t('loadProgress', { project: proj, current, total }, s.language === 'en' ? 'en' : 'zh'));
       });
       const minEpoch = s.minEpoch ?? 2;
       const valid = raw.filter(r => {
@@ -2497,7 +2886,8 @@ function App() {
   const mainContent = () => {
     if (page === 'settings') {
       return <SettingsPage
-        onSaved={() => { refreshMeta(); setPage('list'); loadRuns(); }}
+        onSaved={() => { setSettingsVersion(v => v + 1); refreshMeta(); setPage('list'); loadRuns(); }}
+        onLanguageChange={() => setSettingsVersion(v => v + 1)}
       />;
     }
 
@@ -2505,7 +2895,7 @@ function App() {
       return (
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', gap: 16, color: '#9D9890' }}>
           <div style={{ fontSize: 36 }}>⏳</div>
-          <div style={{ fontSize: 14 }}>{loadMsg || '加载中…'}</div>
+          <div style={{ fontSize: 14 }}>{loadMsg || t('loading', {}, lang)}</div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '80%', maxWidth: 320 }}>
             {[1,2,3,4].map(i => <Skeleton key={i} height={80} radius={10} />)}
           </div>
@@ -2515,9 +2905,9 @@ function App() {
 
     if (error) {
       return (
-        <EmptyState icon="⚠️" title="加载失败" desc={error}>
-          <Btn onClick={loadRuns}>重试</Btn>
-          <Btn variant="subtle" onClick={() => setPage('settings')} style={{ marginLeft: 8 }}>检查配置</Btn>
+        <EmptyState icon="⚠️" title={t('loadFailed', {}, lang)} desc={error}>
+          <Btn onClick={loadRuns}>{t('retry', {}, lang)}</Btn>
+          <Btn variant="subtle" onClick={() => setPage('settings')} style={{ marginLeft: 8 }}>{t('checkSettings', {}, lang)}</Btn>
         </EmptyState>
       );
     }
@@ -2539,8 +2929,8 @@ function App() {
 
     if (page === 'compare') {
       if (compareSelected.length < 2) {
-        return <EmptyState icon="📊" title="请先选择至少 2 条训练进行对比" desc="在列表页开启对比模式，勾选训练后回到此页">
-          <Btn onClick={() => setPage('list')}>去列表页</Btn>
+        return <EmptyState icon="📊" title={t('compareNeedRuns', {}, lang)} desc={t('compareNeedRunsHint', {}, lang)}>
+          <Btn onClick={() => setPage('list')}>{t('goList', {}, lang)}</Btn>
         </EmptyState>;
       }
       return (
@@ -2577,7 +2967,7 @@ function App() {
         {isMobile && (
           <div style={{ padding: '12px 16px', borderBottom: '1px solid #E4E1DA', background: '#FAFAF8', display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
             <span style={{ fontWeight: 800, fontSize: 15, color: '#1C1A17', flex: 1 }}>W&amp;B Logs</span>
-            <button onClick={loadRuns} disabled={loading} style={{ border: 'none', background: 'none', cursor: 'pointer', fontSize: 18, color: '#9D9890', padding: 4 }} title="刷新">↻</button>
+            <button onClick={loadRuns} disabled={loading} style={{ border: 'none', background: 'none', cursor: 'pointer', fontSize: 18, color: '#9D9890', padding: 4 }} title={t('navRefresh', {}, lang)}>↻</button>
           </div>
         )}
 
@@ -2585,10 +2975,10 @@ function App() {
         {!isMobile && page !== 'settings' && !detailRun && (
           <div style={{ padding: '8px 16px', borderBottom: '1px solid #E4E1DA', background: '#fff', display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
             <span style={{ flex: 1, fontSize: 12, color: '#9D9890' }}>
-              {runs.length} 条有效训练（本次训练 ≥{settings.minEpoch ?? 2} epoch）
+              {t('validRuns', { count: runs.length, minEpoch: settings.minEpoch ?? 2 }, lang)}
             </span>
             <button onClick={loadRuns} disabled={loading} style={{ border: '1px solid #E4E1DA', background: '#fff', cursor: 'pointer', borderRadius: 7, padding: '5px 12px', fontSize: 12, color: '#6B6560', fontFamily: 'inherit' }}>
-              {loading ? '加载中…' : '↻ 刷新'}
+              {loading ? t('loading', {}, lang) : t('refresh', {}, lang)}
             </button>
           </div>
         )}
