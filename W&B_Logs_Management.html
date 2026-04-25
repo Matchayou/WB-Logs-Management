@@ -1,0 +1,2702 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>W&amp;B 日志管理</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root { height: 100%; }
+    body { font-family: 'Inter', system-ui, -apple-system, sans-serif; background: #F9F8F5; color: #1C1A17; -webkit-font-smoothing: antialiased; }
+    @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #D1CBC0; border-radius: 10px; }
+    input, select, textarea, button { font-family: inherit; }
+    a { color: inherit; }
+  </style>
+  <script>// W&B API
+const WBApi = (() => {
+  const GQL = 'https://api.wandb.ai/graphql';
+
+  function authHeader(apiKey) {
+    // wandb_v1_* keys use Bearer auth; legacy 40-char hex keys use Basic.
+    if (apiKey.startsWith('wandb_v1_')) return 'Bearer ' + apiKey;
+    return 'Basic ' + btoa(apiKey + ':');
+  }
+
+  // Try multiple proxy strategies in sequence
+  async function gqlWithProxy(apiKey, query, variables, useProxy, customProxyOverride) {
+    const customProxy = (customProxyOverride !== undefined ? customProxyOverride : (WBStore.getSettings().customProxy || '')).trim();
+    const proxies = [];
+    if (customProxy) {
+      // Custom proxy (e.g. Cloudflare Worker) — try first; expects to forward POST to W&B GraphQL
+      proxies.push(() => customProxy.replace(/\/$/, ''));
+    }
+    if (useProxy) {
+      proxies.push(url => `https://corsproxy.io/?url=${encodeURIComponent(url)}`);
+      proxies.push(url => `https://api.cors.lol/?url=${encodeURIComponent(url)}`);
+      proxies.push(url => `https://thingproxy.freeboard.io/fetch/${url}`);
+    }
+    // No direct fallback — would always fail due to CORS
+
+    let lastErr;
+    for (const proxyFn of proxies) {
+      const endpoint = proxyFn(GQL);
+      try {
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Authorization': authHeader(apiKey),
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ query, variables }),
+        });
+        if (!res.ok) {
+          let msg = `HTTP ${res.status}`;
+          if (res.status === 401) msg = 'API Key 无效，请检查';
+          if (res.status === 403) msg = '无权访问，请确认 Entity / Project 名称';
+          throw new Error(msg);
+        }
+        const json = await res.json();
+        if (json.errors) throw new Error(json.errors.map(e => e.message).join('; '));
+        return json.data;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw new Error(lastErr?.message || '所有代理均失败，请检查代理配置');
+  }
+
+  const RUNS_QUERY = `
+    query($entity: String!, $project: String!, $first: Int, $after: String) {
+      project(name: $project, entityName: $entity) {
+        runs(first: $first, after: $after) {
+          pageInfo { endCursor hasNextPage }
+          edges {
+            node {
+              id name displayName state
+              config summaryMetrics tags
+              createdAt heartbeatAt notes
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  function parseRun(node) {
+    let config = {}, summary = {};
+    try { config = JSON.parse(node.config || '{}'); } catch {}
+    try { summary = JSON.parse(node.summaryMetrics || '{}'); } catch {}
+    return { ...node, config, summary };
+  }
+
+  function getUseProxy() {
+    return WBStore.getSettings().useProxy !== false;
+  }
+
+  async function loadAllRuns(apiKey, entity, project, onProgress) {
+    const useProxy = getUseProxy();
+    let all = [], after = null, hasNext = true;
+    while (hasNext) {
+      const data = await gqlWithProxy(apiKey, RUNS_QUERY, { entity, project, first: 100, after }, useProxy);
+      if (!data.project) throw new Error(`找不到项目 "${project}"，请检查 Entity 和 Project 名称`);
+      const { edges, pageInfo } = data.project.runs;
+      const runs = edges.map(e => parseRun(e.node));
+      all = all.concat(runs);
+      if (onProgress) onProgress(all.length, all.length);
+      hasNext = pageInfo.hasNextPage;
+      after = pageInfo.endCursor;
+    }
+    return all;
+  }
+
+  async function loadAllRunsMulti(apiKey, entity, projects, onProgress) {
+    let all = [];
+    for (const project of projects) {
+      const runs = await loadAllRuns(apiKey, entity, project, (n, t) => {
+        if (onProgress) onProgress(all.length + n, all.length + t, project);
+      });
+      runs.forEach(r => { r._project = project; });
+      all = all.concat(runs);
+    }
+    return all;
+  }
+
+  const HISTORY_QUERY = `
+    query($entity: String!, $project: String!, $runName: String!) {
+      project(name: $project, entityName: $entity) {
+        run(name: $runName) {
+          history(samples: 500)
+        }
+      }
+    }
+  `;
+
+  async function loadHistory(apiKey, entity, project, runName, samples = 400, summaryKeys = []) {
+    const useProxy = getUseProxy();
+    const data = await gqlWithProxy(apiKey, HISTORY_QUERY, { entity, project, runName }, useProxy);
+    const raw = data?.project?.run?.history;
+    if (!raw || !Array.isArray(raw)) return [];
+    return raw
+      .map(item => typeof item === 'string' ? JSON.parse(item) : item)
+      .sort((a, b) => (a._step ?? 0) - (b._step ?? 0));
+  }
+
+  async function testConnection(apiKey, entity, project, useProxy = true, customProxyOverride) {
+    const data = await gqlWithProxy(apiKey, RUNS_QUERY, { entity, project, first: 1 }, useProxy, customProxyOverride);
+    if (!data.project) throw new Error(`找不到项目 "${project}"`);
+    return data;
+  }
+
+  async function listProjects(apiKey, entity, useProxy = true, customProxyOverride) {
+    // Step 1: resolve actual entity name and teams from API key
+    const viewerQuery = `
+      query {
+        viewer {
+          entity
+          teams { edges { node { name } } }
+        }
+      }
+    `;
+    const vd = await gqlWithProxy(apiKey, viewerQuery, {}, useProxy, customProxyOverride);
+    if (!vd.viewer) throw new Error('API Key 无效，无法获取用户信息');
+
+    const entities = new Set();
+    if (entity.trim()) entities.add(entity.trim());
+    if (vd.viewer.entity) entities.add(vd.viewer.entity);
+    (vd.viewer.teams?.edges || []).forEach(e => entities.add(e.node.name));
+
+    // Step 2: query models for every accessible entity
+    const modelsQuery = `
+      query($entity: String!) {
+        models(entityName: $entity, first: 100) {
+          edges { node { name } }
+        }
+      }
+    `;
+    const seen = new Set();
+    const all = [];
+    for (const ent of entities) {
+      const d = await gqlWithProxy(apiKey, modelsQuery, { entity: ent }, useProxy, customProxyOverride);
+      (d.models?.edges || []).forEach(e => {
+        if (!seen.has(e.node.name)) { seen.add(e.node.name); all.push(e.node); }
+      });
+    }
+    if (all.length === 0)
+      throw new Error(`在 [${[...entities].join(', ')}] 下均未找到项目，请确认 Entity 名称`);
+    return all;
+  }
+
+  async function loadLogs(apiKey, entity, project, runName) {
+    const useProxy = getUseProxy();
+    // directUrl returns a pre-signed S3/GCS link — no auth header needed
+    const query = `
+      query($entity: String!, $project: String!, $runName: String!) {
+        project(name: $project, entityName: $entity) {
+          run(name: $runName) {
+            files(names: ["output.log"]) {
+              edges { node { name directUrl } }
+            }
+          }
+        }
+      }
+    `;
+    const data = await gqlWithProxy(apiKey, query, { entity, project, runName }, useProxy);
+    const edges = data?.project?.run?.files?.edges || [];
+    if (!edges.length) return null; // run has no output.log
+
+    const fileUrl = edges[0].node.directUrl;
+    if (!fileUrl) return null;
+
+    const proxyBase = (WBStore.getSettings().customProxy || '').replace(/\/$/, '');
+    if (!proxyBase) throw new Error('需要配置本地代理才能获取日志文件');
+
+    // Pre-signed URL: no Authorization header — sending one breaks S3/GCS signature validation
+    const res = await fetch(`${proxyBase}?url=${encodeURIComponent(fileUrl)}`);
+    if (res.status === 404) return null; // file recorded but not uploaded
+    if (!res.ok) throw new Error(`日志文件获取失败 HTTP ${res.status}`);
+    return await res.text();
+  }
+
+  async function loadMetadata(apiKey, entity, project, runName) {
+    const useProxy = getUseProxy();
+    const query = `
+      query($entity: String!, $project: String!, $runName: String!) {
+        project(name: $project, entityName: $entity) {
+          run(name: $runName) {
+            files(names: ["wandb-metadata.json"]) {
+              edges { node { name directUrl } }
+            }
+          }
+        }
+      }
+    `;
+    const data = await gqlWithProxy(apiKey, query, { entity, project, runName }, useProxy);
+    const edges = data?.project?.run?.files?.edges || [];
+    if (!edges.length) return null;
+    const fileUrl = edges[0].node.directUrl;
+    if (!fileUrl) return null;
+    const proxyBase = (WBStore.getSettings().customProxy || '').replace(/\/$/, '');
+    if (!proxyBase) throw new Error('需要配置本地代理才能获取 metadata');
+    const res = await fetch(`${proxyBase}?url=${encodeURIComponent(fileUrl)}`);
+    if (!res.ok) return null;
+    return await res.json();
+  }
+
+  return { testConnection, loadAllRuns, loadAllRunsMulti, loadHistory, loadLogs, loadMetadata, listProjects };
+})();
+</script>
+  <script>// localStorage persistence layer
+const WBStore = (() => {
+  const KEY = 'wb_log_v1';
+
+  const load = () => {
+    try { return JSON.parse(localStorage.getItem(KEY) || '{}'); } catch { return {}; }
+  };
+  const commit = d => localStorage.setItem(KEY, JSON.stringify(d));
+
+  // Settings
+  const getSettings = () => load().settings || {};
+  const saveSettings = patch => {
+    const d = load(); d.settings = { ...d.settings, ...patch }; commit(d);
+  };
+
+  // Per-run metadata (alias, tags, notes, fav)
+  const getMeta = id => (load().runs || {})[id] || {};
+  const patchMeta = (id, patch) => {
+    const d = load();
+    if (!d.runs) d.runs = {};
+    d.runs[id] = { ...d.runs[id], ...patch };
+    commit(d);
+  };
+  const getAllMeta = () => load().runs || {};
+
+  const toggleFav = id => {
+    const m = getMeta(id);
+    const next = !m.fav;
+    patchMeta(id, { fav: next });
+    return next;
+  };
+  const setAlias = (id, alias) => patchMeta(id, { alias: alias.trim() });
+  const setTags  = (id, tags)  => patchMeta(id, { tags });
+  const setNote  = (id, note)  => patchMeta(id, { note });
+
+  // Tag library: [{name, colorIdx}]
+  const getTagLib  = () => load().tagLib || [];
+  const saveTagLib = tags => { const d = load(); d.tagLib = tags; commit(d); };
+
+  const addTagToLib = name => {
+    const lib = getTagLib();
+    if (lib.find(t => t.name === name)) return lib;
+    const next = [...lib, { name, colorIdx: lib.length }];
+    saveTagLib(next);
+    return next;
+  };
+
+  const getCustomConfig = id => (load().customConfigs || {})[id] || '';
+  const setCustomConfig = (id, text) => {
+    const d = load();
+    if (!d.customConfigs) d.customConfigs = {};
+    d.customConfigs[id] = text;
+    commit(d);
+  };
+
+  const getCommandArgs = id => (load().commandArgs || {})[id] ?? null;
+  const setCommandArgs = (id, obj) => {
+    const d = load();
+    if (!d.commandArgs) d.commandArgs = {};
+    d.commandArgs[id] = obj;
+    commit(d);
+  };
+
+  const getUseCommandArgs = id => {
+    const m = (load().settings || {}).useCommandArgsMap || {};
+    return m[id] !== false;
+  };
+  const setUseCommandArgs = (id, val) => {
+    const d = load();
+    if (!d.settings) d.settings = {};
+    d.settings.useCommandArgsMap = { ...(d.settings.useCommandArgsMap || {}), [id]: val };
+    commit(d);
+  };
+
+  return {
+    getSettings, saveSettings,
+    getMeta, patchMeta, getAllMeta,
+    toggleFav, setAlias, setTags, setNote,
+    getTagLib, saveTagLib, addTagToLib,
+    getCustomConfig, setCustomConfig,
+    getCommandArgs, setCommandArgs,
+    getUseCommandArgs, setUseCommandArgs,
+  };
+})();
+</script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">// Shared UI components
+const { useState, useEffect, useRef, useCallback } = React;
+
+const TAG_PALETTE = [
+  { bg: '#EEF1FF', fg: '#3B5BDB' },
+  { bg: '#EBFBEE', fg: '#2F9E44' },
+  { bg: '#FFF9DB', fg: '#E67700' },
+  { bg: '#F3F0FF', fg: '#7048E8' },
+  { bg: '#FFF0F6', fg: '#C2255C' },
+  { bg: '#E3FAFC', fg: '#0B7285' },
+  { bg: '#FFF4E6', fg: '#D9480F' },
+  { bg: '#F0F9FF', fg: '#0369A1' },
+];
+
+function getTagColor(tag, tagLib = []) {
+  const entry = tagLib.find(t => t.name === tag);
+  const idx = entry ? entry.colorIdx : (
+    [...tag].reduce((h, c) => (h * 31 + c.charCodeAt(0)) & 0xFFFF, 0)
+  );
+  return TAG_PALETTE[idx % TAG_PALETTE.length];
+}
+
+function TagChip({ tag, tagLib, onRemove, small }) {
+  const c = getTagColor(tag, tagLib);
+  return (
+    <span style={{
+      display: 'inline-flex', alignItems: 'center', gap: 3,
+      padding: small ? '1px 7px' : '2px 9px',
+      borderRadius: 20, background: c.bg, color: c.fg,
+      fontSize: small ? 11 : 12, fontWeight: 500, lineHeight: '18px',
+      whiteSpace: 'nowrap',
+    }}>
+      {tag}
+      {onRemove && (
+        <button onClick={e => { e.stopPropagation(); onRemove(tag); }} style={{
+          border: 'none', background: 'none', cursor: 'pointer',
+          color: c.fg, padding: '0 0 0 2px', lineHeight: 1, fontSize: 14, opacity: 0.7,
+        }}>×</button>
+      )}
+    </span>
+  );
+}
+
+function StateBadge({ state }) {
+  const MAP = {
+    finished: { bg: '#DCFCE7', fg: '#15803D', label: '已完成' },
+    running:  { bg: '#DBEAFE', fg: '#1D4ED8', label: '运行中' },
+    crashed:  { bg: '#FEE2E2', fg: '#DC2626', label: '崩溃'   },
+    failed:   { bg: '#FEE2E2', fg: '#DC2626', label: '失败'   },
+  };
+  const s = MAP[state] || { bg: '#F3F4F6', fg: '#6B7280', label: state || '未知' };
+  return (
+    <span style={{
+      padding: '2px 8px', borderRadius: 20, fontSize: 11, fontWeight: 600,
+      background: s.bg, color: s.fg, letterSpacing: '0.02em', whiteSpace: 'nowrap',
+    }}>{s.label}</span>
+  );
+}
+
+function StarBtn({ active, onClick }) {
+  return (
+    <button onClick={e => { e.stopPropagation(); onClick(); }} style={{
+      border: 'none', background: 'none', cursor: 'pointer',
+      fontSize: 20, padding: '2px 4px', lineHeight: 1,
+      color: active ? '#F59E0B' : '#D1D5DB',
+      transition: 'color 0.15s, transform 0.1s',
+      flexShrink: 0,
+    }}
+    onMouseEnter={e => e.currentTarget.style.transform = 'scale(1.2)'}
+    onMouseLeave={e => e.currentTarget.style.transform = 'scale(1)'}
+    title={active ? '取消收藏' : '收藏'}>
+      {active ? '★' : '☆'}
+    </button>
+  );
+}
+
+function Skeleton({ width = '100%', height = 14, radius = 4, style = {} }) {
+  return (
+    <div style={{
+      width, height, borderRadius: radius,
+      background: 'linear-gradient(90deg,#F3F2EF 25%,#E8E5DC 50%,#F3F2EF 75%)',
+      backgroundSize: '200% 100%',
+      animation: 'shimmer 1.4s ease-in-out infinite',
+      ...style,
+    }} />
+  );
+}
+
+function EmptyState({ icon = '📭', title, desc, children }) {
+  return (
+    <div style={{ textAlign: 'center', padding: '64px 24px', color: '#9D9890' }}>
+      <div style={{ fontSize: 44, marginBottom: 12, lineHeight: 1 }}>{icon}</div>
+      <div style={{ fontSize: 16, fontWeight: 600, color: '#6B6560', marginBottom: 6 }}>{title}</div>
+      {desc && <div style={{ fontSize: 13, marginBottom: 20, maxWidth: 320, margin: '0 auto 20px' }}>{desc}</div>}
+      {children}
+    </div>
+  );
+}
+
+function Btn({ onClick, children, variant = 'primary', small, style: s = {}, disabled }) {
+  const base = {
+    border: 'none', borderRadius: 8, cursor: disabled ? 'not-allowed' : 'pointer',
+    fontFamily: 'inherit', fontWeight: 500, transition: 'all 0.15s',
+    padding: small ? '6px 12px' : '9px 18px',
+    fontSize: small ? 13 : 14,
+    opacity: disabled ? 0.5 : 1,
+  };
+  const variants = {
+    primary: { background: '#4B6BFB', color: '#fff' },
+    ghost:   { background: 'transparent', color: '#4B6BFB', border: '1px solid #4B6BFB' },
+    danger:  { background: '#FEE2E2', color: '#DC2626' },
+    subtle:  { background: '#F3F2EF', color: '#1C1A17' },
+  };
+  return (
+    <button onClick={disabled ? undefined : onClick} style={{ ...base, ...variants[variant], ...s }}
+      onMouseEnter={e => !disabled && (e.currentTarget.style.filter = 'brightness(0.93)')}
+      onMouseLeave={e => e.currentTarget.style.filter = ''}>
+      {children}
+    </button>
+  );
+}
+
+function Modal({ open, onClose, title, children, width = 480 }) {
+  useEffect(() => {
+    if (!open) return;
+    const onKey = e => e.key === 'Escape' && onClose();
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [open, onClose]);
+  if (!open) return null;
+  return (
+    <div onClick={onClose} style={{
+      position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      zIndex: 1000, padding: 16,
+    }}>
+      <div onClick={e => e.stopPropagation()} style={{
+        background: '#fff', borderRadius: 14, width: '100%', maxWidth: width,
+        boxShadow: '0 20px 60px rgba(0,0,0,0.2)', overflow: 'hidden',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 20px', borderBottom: '1px solid #E4E1DA' }}>
+          <span style={{ fontWeight: 700, fontSize: 15 }}>{title}</span>
+          <button onClick={onClose} style={{ border: 'none', background: 'none', cursor: 'pointer', fontSize: 20, color: '#9D9890', padding: 4 }}>×</button>
+        </div>
+        <div style={{ padding: 20 }}>{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function RunCard({ run, meta, tagLib, onToggleFav, onSelect, selected, onOpen, compareMode, metrics, cardFields }) {
+  const alias = meta.alias || run.displayName || run.name;
+  const origName = run.name;
+  const hasConfig = React.useMemo(() => !!WBStore.getCustomConfig(run.name).trim(), [run.name]);
+  const tags = meta.tags || run.tags || [];
+  const fields = cardFields || [...BUILTIN_FIELDS.map(f => f.key), ...(metrics || [])];
+  const config = parseConfig(run.config || {});
+
+  const renderValue = (v) => {
+    if (v == null) return null;
+    if (typeof v === 'number') return v % 1 === 0 ? String(v) : v.toFixed(4);
+    if (typeof v === 'object') return JSON.stringify(v);
+    return String(v);
+  };
+
+  // Collect extra fields (non-builtin) to show in the metrics row
+  const extraFields = fields.filter(k => !BUILTIN_FIELDS.some(f => f.key === k));
+
+  return (
+    <div
+      onClick={() => !compareMode && onOpen && onOpen(run)}
+      style={{
+        background: '#FFFFFF',
+        border: selected ? '2px solid #4B6BFB' : '1px solid #E4E1DA',
+        borderRadius: 10, padding: '13px 15px',
+        cursor: compareMode ? 'default' : 'pointer',
+        transition: 'box-shadow 0.15s', boxShadow: '0 1px 3px rgba(0,0,0,0.05)',
+        userSelect: 'none',
+      }}
+      onMouseEnter={e => !compareMode && (e.currentTarget.style.boxShadow = '0 4px 14px rgba(0,0,0,0.09)')}
+      onMouseLeave={e => e.currentTarget.style.boxShadow = '0 1px 3px rgba(0,0,0,0.05)'}
+    >
+      {/* Header row */}
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 7 }}>
+        {compareMode && (
+          <input type="checkbox" checked={!!selected} onChange={() => onSelect(run)}
+            onClick={e => e.stopPropagation()}
+            style={{ marginTop: 3, cursor: 'pointer', width: 15, height: 15, accentColor: '#4B6BFB' }} />
+        )}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 600, fontSize: 14, color: '#1C1A17', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 5 }}>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{alias}</span>
+            {hasConfig && <span title="已填写训练配置" style={{ flexShrink: 0, width: 16, height: 16, borderRadius: '50%', background: '#2F9E44', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, color: '#fff', fontWeight: 700 }}>✓</span>}
+          </div>
+          {alias !== origName && (
+            <div style={{ fontSize: 11, color: '#B0A99E', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 1 }}>{origName}</div>
+          )}
+        </div>
+        <StateBadge state={run.state} />
+        <StarBtn active={!!meta.fav} onClick={() => onToggleFav(run.name)} />
+      </div>
+
+      {/* Tags */}
+      {fields.includes('tags') && tags.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 8 }}>
+          {tags.map(t => <TagChip key={t} tag={t} tagLib={tagLib} small />)}
+        </div>
+      )}
+
+      {/* Fields row */}
+      {(fields.includes('epoch') || fields.includes('epochCount') || extraFields.length > 0 || fields.includes('time') || fields.includes('project')) && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14, fontSize: 12, color: '#6B6560', alignItems: 'center' }}>
+          {fields.includes('epoch') && (() => {
+            const epoch = (run.summary || {}).epoch ?? (run.summary || {})._epoch;
+            return epoch != null ? <span>Epoch&nbsp;<strong style={{ color: '#1C1A17', fontSize: 13 }}>{epoch}</strong></span> : null;
+          })()}
+          {fields.includes('epochCount') && (() => {
+            const count = getEpochCount(run);
+            return count != null ? <span>本次&nbsp;<strong style={{ color: '#1C1A17', fontSize: 13 }}>{count}</strong>&nbsp;epoch</span> : null;
+          })()}
+          {extraFields.map(k => {
+            const v = (run.summary || {})[k] ?? config[k];
+            const rendered = renderValue(v);
+            if (rendered == null) return null;
+            return <span key={k}>{k}&nbsp;<strong style={{ color: '#1C1A17', fontSize: 13 }}>{rendered}</strong></span>;
+          })}
+          {fields.includes('time') && (
+            <span style={{ marginLeft: 'auto', fontSize: 11, color: '#B0A99E' }}>{fmtTime(run.createdAt)}</span>
+          )}
+          {fields.includes('project') && run._project && (
+            <span style={{ fontSize: 11, color: '#B0A99E', background: '#F3F2EF', borderRadius: 4, padding: '1px 6px' }}>{run._project}</span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function fmtTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts), now = new Date();
+  const diff = (now - d) / 1000;
+  if (diff < 60) return '刚刚';
+  if (diff < 3600) return `${Math.floor(diff / 60)}分钟前`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}小时前`;
+  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)}天前`;
+  return d.toLocaleDateString('zh-CN');
+}
+
+function parseConfig(config = {}) {
+  const out = {};
+  for (const [k, v] of Object.entries(config)) {
+    if (k.startsWith('_')) continue;
+    out[k] = (v && typeof v === 'object' && 'value' in v) ? v.value : v;
+  }
+  return out;
+}
+
+function getEpoch(run) {
+  const s = run.summary || {};
+  return s.epoch ?? s._epoch ?? null;
+}
+
+function getEpochCount(run) {
+  const step = (run.summary || {})._step;
+  return step != null ? Number(step) + 1 : null;
+}
+
+function isValidRun(run, minEpoch = 2) {
+  const count = getEpochCount(run);
+  return count !== null && count >= minEpoch;
+}
+
+function parseCommandArgs(args) {
+  if (!Array.isArray(args)) return {};
+  const result = {};
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (!a.startsWith('-')) continue;
+    const key = a.replace(/^--?/, '').replace(/-/g, '_');
+    if (!key) continue;
+    const next = args[i + 1];
+    if (!next || next.startsWith('-')) {
+      result[key] = true;
+    } else {
+      const n = Number(next);
+      result[key] = (!isNaN(n) && next.trim() !== '') ? n
+        : next === 'true' ? true
+        : next === 'false' ? false
+        : next;
+      i++;
+    }
+  }
+  return result;
+}
+
+function flattenJson(obj, prefix = '') {
+  const result = {};
+  for (const [k, v] of Object.entries(obj || {})) {
+    const key = prefix ? `${prefix}.${k}` : k;
+    if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
+      Object.assign(result, flattenJson(v, key));
+    } else {
+      result[key] = Array.isArray(v) ? v.join(', ') : v;
+    }
+  }
+  return result;
+}
+
+function CustomConfigTab({ runName }) {
+  const [text, setText] = React.useState(() => WBStore.getCustomConfig(runName));
+  const [parsed, setParsed] = React.useState(null);
+  const [parseError, setParseError] = React.useState('');
+
+  React.useEffect(() => {
+    if (!text.trim()) { setParsed(null); setParseError(''); return; }
+    try { setParsed(flattenJson(JSON.parse(text))); setParseError(''); }
+    catch (e) { setParsed(null); setParseError(e.message); }
+  }, [text]);
+
+  const handleChange = val => { setText(val); WBStore.setCustomConfig(runName, val); };
+  const entries = parsed ? Object.entries(parsed) : [];
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      <div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+          <span style={{ fontSize: 11, fontWeight: 600, color: '#6B6560', textTransform: 'uppercase', letterSpacing: '0.04em' }}>粘贴训练配置 JSON</span>
+          {text && <button onClick={() => handleChange('')} style={{ border: 'none', background: 'none', cursor: 'pointer', color: '#B0A99E', fontSize: 11, fontFamily: 'inherit' }}>清除</button>}
+        </div>
+        <textarea value={text} onChange={e => handleChange(e.target.value)}
+          placeholder={'{\n  "learning_rate": 0.001,\n  "batch_size": 32\n}'}
+          style={{ width: '100%', boxSizing: 'border-box', height: 160, padding: '10px 12px',
+            borderRadius: 8, border: `1px solid ${parseError ? '#E03131' : '#E4E1DA'}`,
+            fontFamily: 'monospace', fontSize: 12, lineHeight: 1.6, resize: 'vertical',
+            outline: 'none', background: '#FAFAF8', color: '#1C1A17' }} />
+        {parseError && <div style={{ color: '#E03131', fontSize: 11, marginTop: 4 }}>JSON 解析错误：{parseError}</div>}
+      </div>
+      {entries.length > 0 && (
+        <div>
+          <div style={{ fontSize: 11, fontWeight: 600, color: '#6B6560', marginBottom: 6,
+            textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+            识别结果 · {entries.length} 个参数
+          </div>
+          <div style={{ borderRadius: 8, border: '1px solid #E4E1DA', overflow: 'hidden' }}>
+            {entries.map(([k, v], i) => (
+              <div key={k} style={{ display: 'flex', gap: 12, padding: '7px 12px',
+                background: i % 2 === 0 ? '#FAFAF8' : '#fff',
+                borderBottom: i < entries.length - 1 ? '1px solid #F0EDE7' : 'none' }}>
+                <span style={{ fontFamily: 'monospace', fontSize: 11, color: '#4B6BFB', minWidth: 160, flexShrink: 0 }}>{k}</span>
+                <span style={{ fontSize: 13, color: '#1C1A17', wordBreak: 'break-all' }}>
+                  {v === null ? <em style={{ color: '#B0A99E' }}>null</em> : typeof v === 'boolean'
+                    ? <span style={{ color: v ? '#2F9E44' : '#E03131', fontWeight: 600 }}>{String(v)}</span>
+                    : String(v)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {text.trim() && !parseError && entries.length === 0 && (
+        <div style={{ color: '#9D9890', fontSize: 13, textAlign: 'center', padding: 20 }}>JSON 为空对象</div>
+      )}
+    </div>
+  );
+}
+
+Object.assign(window, {
+  TagChip, StateBadge, StarBtn, Skeleton, EmptyState, Btn, Modal, RunCard,
+  fmtTime, parseConfig, getEpoch, getEpochCount, isValidRun, TAG_PALETTE, getTagColor,
+  parseCommandArgs, flattenJson, CustomConfigTab,
+});
+</script>
+  <script type="text/babel">// Run List Page (also used for Favorites)
+const { useState, useMemo, useCallback, useRef, useEffect } = React;
+
+// Inner component: all per-project state lives here; key prop resets it on tab switch
+function ProjectRunList({ runs, allMeta, tagLib, onToggleFav, onOpenRun, compareSelected, onToggleCompare, favOnly, metrics, cardFields, onChangeCardFields, defaultSortKey, onSetDefaultSort, filterStates, onFilterStatesChange }) {
+  const [search, setSearch] = useState('');
+  const [filterTags, setFilterTags] = useState([]);
+  const [sortKey, setSortKey] = useState(defaultSortKey);
+  const [sortDir, setSortDir] = useState(defaultSortKey === 'time' ? 'asc' : 'desc');
+  const [compareMode, setCompareMode] = useState(false);
+
+  const handleSortKey = useCallback((key) => {
+    setSortKey(key);
+    setSortDir(key === 'time' ? 'asc' : 'desc');
+  }, []);
+
+  const sortableKeys = useMemo(() => {
+    const s = new Set();
+    runs.forEach(r => Object.entries(r.summary || {}).forEach(([k, v]) => {
+      if (!k.startsWith('_') && typeof v === 'number') s.add(k);
+    }));
+    return [...s].sort();
+  }, [runs]);
+
+  const summaryKeys = sortableKeys;
+  const configKeys = useMemo(() => {
+    const s = new Set();
+    runs.forEach(r => Object.keys(parseConfig(r.config || {})).forEach(k => s.add(k)));
+    return [...s].sort();
+  }, [runs]);
+
+  const allTags = useMemo(() => {
+    const set = new Set();
+    runs.forEach(r => { ((allMeta[r.name] || {}).tags || r.tags || []).forEach(t => set.add(t)); });
+    return [...set];
+  }, [runs, allMeta]);
+
+  const filtered = useMemo(() => {
+    let list = runs;
+    if (favOnly) list = list.filter(r => (allMeta[r.name] || {}).fav);
+    if (filterTags.length) list = list.filter(r => filterTags.some(t => ((allMeta[r.name] || {}).tags || r.tags || []).includes(t)));
+    if (filterStates.length) list = list.filter(r => filterStates.includes(r.state));
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      list = list.filter(r => {
+        const alias       = (allMeta[r.name] || {}).alias || '';
+        const displayName = r.displayName || '';
+        const tags        = ((allMeta[r.name] || {}).tags || r.tags || []).join(' ');
+        const notes       = (allMeta[r.name] || {}).note || r.notes || '';
+        return r.name.toLowerCase().includes(q) || displayName.toLowerCase().includes(q)
+          || alias.toLowerCase().includes(q) || tags.toLowerCase().includes(q) || notes.toLowerCase().includes(q);
+      });
+    }
+    const dir = sortDir === 'desc' ? -1 : 1;
+    list = [...list].sort((a, b) => {
+      let diff = 0;
+      if (sortKey === 'time') diff = new Date(b.createdAt) - new Date(a.createdAt);
+      else if (sortKey === 'epoch') diff = (getEpoch(b) || 0) - (getEpoch(a) || 0);
+      else {
+        const av = (a.summary || {})[sortKey] ?? (sortDir === 'desc' ? -Infinity : Infinity);
+        const bv = (b.summary || {})[sortKey] ?? (sortDir === 'desc' ? -Infinity : Infinity);
+        diff = bv - av;
+      }
+      return diff * dir;
+    });
+    return list;
+  }, [runs, allMeta, favOnly, filterTags, filterStates, search, sortKey, sortDir]);
+
+  const selectedCount = compareSelected.length;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
+      {/* Toolbar */}
+      <div style={{ padding: '12px 16px', borderBottom: '1px solid #E4E1DA', background: '#FAFAF8', flexShrink: 0 }}>
+        <div style={{ position: 'relative', marginBottom: 10 }}>
+          <span style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: '#B0A99E', fontSize: 15 }}>🔍</span>
+          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索名称、别名、标签…"
+            style={{ width: '100%', boxSizing: 'border-box', padding: '8px 12px 8px 34px', borderRadius: 8,
+              border: '1px solid #E4E1DA', fontSize: 13, background: '#fff', fontFamily: 'inherit', outline: 'none', color: '#1C1A17' }} />
+        </div>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          <MultiSelectPicker
+            label="标签" selected={filterTags} onChange={setFilterTags}
+            options={allTags.map(t => ({ key: t, label: t }))}
+            emptyText="无可用标签"
+          />
+          <MultiSelectPicker
+            label="状态" selected={filterStates} onChange={onFilterStatesChange}
+            options={[
+              { key: 'finished', label: '已完成', color: '#2F9E44' },
+              { key: 'running',  label: '运行中',  color: '#1971C2' },
+              { key: 'crashed',  label: '崩溃',   color: '#C92A2A' },
+              { key: 'killed',   label: '已终止',  color: '#E67700' },
+            ]}
+            emptyText="无可用状态"
+          />
+          <SortPicker sortKey={sortKey} sortDir={sortDir} onSort={handleSortKey} onDir={setSortDir}
+            sortableKeys={sortableKeys} metrics={metrics} defaultKey={defaultSortKey} onSetDefault={onSetDefaultSort} />
+          <FieldPicker cardFields={cardFields} onChangeFields={onChangeCardFields} summaryKeys={summaryKeys} configKeys={configKeys} />
+          <span style={{ marginLeft: 'auto', fontSize: 12, color: '#9D9890' }}>{filtered.length} 条</span>
+          <Btn small variant={compareMode ? 'primary' : 'ghost'} onClick={() => setCompareMode(m => !m)}>
+            {compareMode ? '退出对比' : '对比模式'}
+          </Btn>
+        </div>
+      </div>
+
+      {/* Run list */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 10 }}>
+        {filtered.length === 0 ? (
+          <EmptyState icon={favOnly ? '⭐' : '📭'}
+            title={favOnly ? '暂无收藏' : '没有找到符合条件的训练'}
+            desc={favOnly ? '在训练列表中点击 ☆ 添加收藏' : '尝试调整搜索或过滤条件'} />
+        ) : filtered.map(run => (
+          <RunCard key={run.name} run={run} meta={allMeta[run.name] || {}} tagLib={tagLib}
+            onToggleFav={onToggleFav} onOpen={onOpenRun} compareMode={compareMode}
+            selected={compareSelected.some(r => r.name === run.name)} onSelect={onToggleCompare}
+            metrics={metrics} cardFields={cardFields} />
+        ))}
+      </div>
+
+      {/* Compare floating bar */}
+      {compareMode && selectedCount > 0 && (
+        <div style={{
+          position: 'sticky', bottom: 0, background: '#1C1A17', color: '#fff',
+          padding: '12px 20px', display: 'flex', alignItems: 'center', gap: 12,
+          borderTop: '1px solid #333', flexShrink: 0,
+        }}>
+          <span style={{ flex: 1, fontSize: 14 }}>已选 <strong>{selectedCount}</strong> 条训练</span>
+          {selectedCount > 1 && (
+            <Btn variant="primary" small onClick={() => window.__goCompare && window.__goCompare()}>
+              开始对比 →
+            </Btn>
+          )}
+          <Btn variant="subtle" small onClick={() => window.__clearCompare && window.__clearCompare()}
+            style={{ background: '#333', color: '#ccc' }}>
+            清空
+          </Btn>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ListPage({ runs, allMeta, tagLib, onToggleFav, onOpenRun, compareSelected, onToggleCompare, favOnly, metrics }) {
+  const projects = useMemo(() => [...new Set(runs.map(r => r._project).filter(Boolean))].sort(), [runs]);
+  const multiProject = projects.length > 1;
+  const [activeProject, setActiveProject] = useState(() => {
+    const saved = WBStore.getSettings().activeProject;
+    return (saved && projects.includes(saved)) ? saved : (projects[0] || '');
+  });
+
+  const handleSetActiveProject = (p) => {
+    setActiveProject(p);
+    WBStore.saveSettings({ activeProject: p });
+  };
+
+  // Keep activeProject valid when runs change
+  React.useEffect(() => {
+    if (multiProject && activeProject && !projects.includes(activeProject)) handleSetActiveProject(projects[0] || '');
+  }, [projects.join(',')]);
+
+  const [filterStatesMap, setFilterStatesMap] = useState(() => WBStore.getSettings().filterStatesMap || {});
+  const filterStates = filterStatesMap[activeProject] ?? EMPTY;
+  const handleFilterStatesChange = useCallback((states) => {
+    const updated = { ...filterStatesMap, [activeProject]: states };
+    setFilterStatesMap(updated);
+    WBStore.saveSettings({ filterStatesMap: updated });
+  }, [filterStatesMap, activeProject]);
+
+  const [defaultSortKeys, setDefaultSortKeys] = useState(() => WBStore.getSettings().defaultSortKeys || {});
+  const defaultSortKey = defaultSortKeys[activeProject] || 'time';
+  const handleSetDefaultSort = useCallback((key) => {
+    const next = key === defaultSortKeys[activeProject] ? 'time' : key;
+    const updated = { ...defaultSortKeys, [activeProject]: next };
+    setDefaultSortKeys(updated);
+    WBStore.saveSettings({ defaultSortKeys: updated });
+  }, [defaultSortKeys, activeProject]);
+
+  const [cardFields, setCardFields] = useState(() => {
+    const saved = WBStore.getSettings().cardFields;
+    return saved || [...BUILTIN_FIELDS.map(f => f.key), ...metrics.slice(0, 3)];
+  });
+  const handleCardFieldsChange = useCallback((fields) => {
+    setCardFields(fields);
+    WBStore.saveSettings({ cardFields: fields });
+  }, []);
+
+  const projectRuns = useMemo(() =>
+    multiProject ? runs.filter(r => r._project === activeProject) : runs,
+  [runs, activeProject, multiProject]);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
+      {/* Project tabs */}
+      {multiProject && (
+        <div style={{ display: 'flex', borderBottom: '2px solid #E4E1DA', background: '#fff',
+          flexShrink: 0, overflowX: 'auto' }}>
+          {projects.map(p => {
+            const count = runs.filter(r => r._project === p).length;
+            const active = p === activeProject;
+            return (
+              <button key={p} onClick={() => handleSetActiveProject(p)} style={{
+                padding: '10px 18px', border: 'none', background: 'none', cursor: 'pointer',
+                borderBottom: active ? '2px solid #4B6BFB' : '2px solid transparent',
+                marginBottom: -2,
+                color: active ? '#4B6BFB' : '#6B6560',
+                fontWeight: active ? 700 : 400,
+                fontSize: 13, fontFamily: 'inherit', whiteSpace: 'nowrap',
+                display: 'flex', alignItems: 'center', gap: 6,
+                transition: 'color 0.15s',
+              }}>
+                {p}
+                <span style={{
+                  fontSize: 11, padding: '1px 6px', borderRadius: 10, fontWeight: 600,
+                  background: active ? '#EEF1FF' : '#F3F2EF',
+                  color: active ? '#4B6BFB' : '#9D9890',
+                }}>{count}</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Per-project list — key resets all inner state on tab switch */}
+      <ProjectRunList
+        key={activeProject}
+        runs={projectRuns}
+        allMeta={allMeta} tagLib={tagLib}
+        onToggleFav={onToggleFav} onOpenRun={onOpenRun}
+        compareSelected={compareSelected} onToggleCompare={onToggleCompare}
+        favOnly={favOnly} metrics={metrics}
+        cardFields={cardFields} onChangeCardFields={handleCardFieldsChange}
+        defaultSortKey={defaultSortKey} onSetDefaultSort={handleSetDefaultSort}
+        filterStates={filterStates} onFilterStatesChange={handleFilterStatesChange}
+      />
+    </div>
+  );
+}
+
+const selectStyle = {
+  padding: '6px 10px', borderRadius: 7, border: '1px solid #E4E1DA',
+  fontSize: 12, background: '#fff', fontFamily: 'inherit',
+  color: '#1C1A17', cursor: 'pointer', outline: 'none',
+};
+
+const SORT_BASE = [
+  { key: 'time',  label: '创建时间' },
+  { key: 'epoch', label: 'Epoch 数' },
+];
+
+function SortPicker({ sortKey, sortDir, onSort, onDir, sortableKeys, metrics, defaultKey, onSetDefault }) {
+  const [open, setOpen]     = useState(false);
+  const [query, setQuery]   = useState('');
+  const [ctxMenu, setCtxMenu] = useState(null); // { x, y, itemKey, label }
+  const ref   = useRef(null);
+  const input = useRef(null);
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    if (!open) return;
+    const handler = e => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [open]);
+
+  // Close context menu on any click
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const handler = () => setCtxMenu(null);
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [ctxMenu]);
+
+  // Focus search on open
+  useEffect(() => { if (open) setTimeout(() => input.current?.focus(), 50); }, [open]);
+
+  const trainKeys  = metrics.filter(k => sortableKeys.includes(k));
+  const otherKeys  = sortableKeys.filter(k => !metrics.includes(k));
+
+  const q = query.toLowerCase();
+  const matchBase  = SORT_BASE.filter(i => !q || i.label.includes(q) || i.key.includes(q));
+  const matchTrain = trainKeys.filter(k => !q || k.toLowerCase().includes(q));
+  const matchOther = otherKeys.filter(k => !q || k.toLowerCase().includes(q));
+
+  const currentLabel = SORT_BASE.find(i => i.key === sortKey)?.label || sortKey;
+  const defaultLabel = SORT_BASE.find(i => i.key === defaultKey)?.label || defaultKey || '时间';
+
+  const pick = (key) => { onSort(key); setOpen(false); setQuery(''); };
+
+  const handleContextMenu = (e, itemKey, label) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setCtxMenu({ x: e.clientX, y: e.clientY, itemKey, label: label || itemKey });
+  };
+
+  const SectionLabel = ({ children }) => (
+    <div style={{ padding: '6px 12px 3px', fontSize: 10, fontWeight: 700, color: '#B0A99E',
+      textTransform: 'uppercase', letterSpacing: '0.08em' }}>{children}</div>
+  );
+
+  const Item = ({ itemKey, label }) => {
+    const active = itemKey === sortKey;
+    const isDefault = itemKey === defaultKey;
+    return (
+      <div onClick={() => pick(itemKey)}
+        onContextMenu={e => handleContextMenu(e, itemKey, label)}
+        style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          padding: '7px 12px', cursor: 'pointer', borderRadius: 6, margin: '1px 4px',
+          background: active ? '#EEF1FF' : 'transparent',
+          color: active ? '#4B6BFB' : '#1C1A17',
+          fontSize: 13, fontWeight: active ? 600 : 400,
+          transition: 'background 0.1s',
+        }}
+        onMouseEnter={e => { if (!active) e.currentTarget.style.background = '#F5F4F1'; }}
+        onMouseLeave={e => { if (!active) e.currentTarget.style.background = 'transparent'; }}
+      >
+        <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+          {isDefault && <span title="默认排序" style={{ fontSize: 11, color: '#F59F00' }}>★</span>}
+          {label || itemKey}
+        </span>
+        {active && (
+          <button onClick={e => { e.stopPropagation(); onDir(d => d === 'desc' ? 'asc' : 'desc'); }}
+            style={{ border: 'none', background: '#D6DCFF', color: '#4B6BFB',
+              borderRadius: 4, padding: '1px 6px', fontSize: 12, cursor: 'pointer',
+              fontFamily: 'inherit', fontWeight: 700 }}>
+            {sortDir === 'desc' ? '↓ 降序' : '↑ 升序'}
+          </button>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div ref={ref} style={{ position: 'relative' }}>
+      <button onClick={() => setOpen(o => !o)} style={{
+        ...selectStyle, display: 'flex', alignItems: 'center', gap: 5,
+        borderColor: open ? '#4B6BFB' : '#E4E1DA',
+        background: open ? '#F0F3FF' : '#fff',
+        color: open ? '#4B6BFB' : '#1C1A17',
+      }}>
+        <span>排序：{currentLabel}</span>
+        <span style={{ fontSize: 10, color: '#9D9890' }}>{sortDir === 'desc' ? '↓' : '↑'}</span>
+        <span style={{ fontSize: 10 }}>▾</span>
+      </button>
+
+      {/* Right-click context menu */}
+      {ctxMenu && (
+        <div onMouseDown={e => e.stopPropagation()} style={{
+          position: 'fixed', left: ctxMenu.x, top: ctxMenu.y, zIndex: 9999,
+          background: '#fff', border: '1px solid #E4E1DA', borderRadius: 8,
+          boxShadow: '0 6px 20px rgba(0,0,0,0.13)', padding: '4px',
+          minWidth: 160,
+        }}>
+          <div style={{ padding: '4px 10px 6px', fontSize: 11, color: '#B0A99E', borderBottom: '1px solid #F0EDE7', marginBottom: 3 }}>
+            {ctxMenu.label}
+          </div>
+          <button onClick={() => { onSetDefault(ctxMenu.itemKey); setCtxMenu(null); }}
+            style={{ display: 'flex', alignItems: 'center', gap: 7, width: '100%',
+              padding: '7px 10px', border: 'none', background: 'none', cursor: 'pointer',
+              fontSize: 13, fontFamily: 'inherit', color: '#1C1A17', borderRadius: 5,
+              textAlign: 'left',
+            }}
+            onMouseEnter={e => e.currentTarget.style.background = '#F5F4F1'}
+            onMouseLeave={e => e.currentTarget.style.background = 'none'}
+          >
+            <span style={{ color: '#F59F00' }}>★</span>
+            {ctxMenu.itemKey === defaultKey ? '取消默认排序' : '设为默认排序'}
+          </button>
+        </div>
+      )}
+
+      {open && (
+        <div style={{
+          position: 'absolute', top: 'calc(100% + 6px)', left: 0, zIndex: 999,
+          background: '#fff', border: '1px solid #E4E1DA', borderRadius: 10,
+          boxShadow: '0 8px 24px rgba(0,0,0,0.12)', width: 240,
+          maxHeight: 360, display: 'flex', flexDirection: 'column',
+        }}>
+          {/* Search */}
+          <div style={{ padding: '8px 8px 4px' }}>
+            <input ref={input} value={query} onChange={e => setQuery(e.target.value)}
+              placeholder="搜索指标…"
+              style={{ width: '100%', boxSizing: 'border-box', padding: '6px 10px',
+                borderRadius: 7, border: '1px solid #E4E1DA', fontSize: 12,
+                fontFamily: 'inherit', outline: 'none' }} />
+          </div>
+          {/* Default hint */}
+          {defaultKey && (
+            <div style={{ padding: '2px 12px 4px', fontSize: 11, color: '#B0A99E' }}>
+              默认排序：<span style={{ color: '#F59F00' }}>★</span> {defaultLabel}
+            </div>
+          )}
+          {/* List */}
+          <div style={{ overflowY: 'auto', paddingBottom: 6 }}>
+            {matchBase.length > 0 && (<>
+              <SectionLabel>基础</SectionLabel>
+              {matchBase.map(i => <Item key={i.key} itemKey={i.key} label={i.label} />)}
+            </>)}
+            {matchTrain.length > 0 && (<>
+              <SectionLabel>训练指标</SectionLabel>
+              {matchTrain.map(k => <Item key={k} itemKey={k} />)}
+            </>)}
+            {matchOther.length > 0 && (<>
+              <SectionLabel>其他指标</SectionLabel>
+              {matchOther.map(k => <Item key={k} itemKey={k} />)}
+            </>)}
+            {matchBase.length + matchTrain.length + matchOther.length === 0 && (
+              <div style={{ padding: '16px 12px', textAlign: 'center', fontSize: 12, color: '#B0A99E' }}>
+                无匹配指标
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const EMPTY = [];
+
+function useFloatingPicker(inputRef) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!open) return;
+    const h = e => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener('mousedown', h);
+    return () => document.removeEventListener('mousedown', h);
+  }, [open]);
+  useEffect(() => { if (open) setTimeout(() => inputRef.current?.focus(), 50); }, [open]);
+  return { open, setOpen, query, setQuery, ref };
+}
+
+const BUILTIN_FIELDS = [
+  { key: 'tags',       label: '标签' },
+  { key: 'epoch',      label: 'Epoch' },
+  { key: 'epochCount', label: '本次 Epoch 数' },
+  { key: 'time',       label: '创建时间' },
+  { key: 'project',    label: '项目名' },
+];
+
+function FieldPicker({ cardFields, onChangeFields, summaryKeys, configKeys }) {
+  const input = useRef(null);
+  const { open, setOpen, query, setQuery, ref } = useFloatingPicker(input);
+
+  const toggle = (key) => {
+    const next = cardFields.includes(key) ? cardFields.filter(k => k !== key) : [...cardFields, key];
+    onChangeFields(next);
+  };
+
+  const q = query.toLowerCase();
+  const fBuiltin  = BUILTIN_FIELDS.filter(f => !q || f.label.includes(q) || f.key.includes(q));
+  const fSummary  = summaryKeys.filter(k => !q || k.toLowerCase().includes(q));
+  const fConfig   = configKeys.filter(k => !q || k.toLowerCase().includes(q));
+
+  const SectionLabel = ({ children }) => (
+    <div style={{ padding: '6px 12px 3px', fontSize: 10, fontWeight: 700, color: '#B0A99E',
+      textTransform: 'uppercase', letterSpacing: '0.08em' }}>{children}</div>
+  );
+
+  const Item = ({ fieldKey, label }) => {
+    const on = cardFields.includes(fieldKey);
+    return (
+      <div onClick={() => toggle(fieldKey)} style={{
+        display: 'flex', alignItems: 'center', gap: 8,
+        padding: '7px 12px', cursor: 'pointer', borderRadius: 6, margin: '1px 4px',
+        background: on ? '#EEF1FF' : 'transparent', fontSize: 13,
+        color: on ? '#4B6BFB' : '#1C1A17', fontWeight: on ? 600 : 400,
+        transition: 'background 0.1s',
+      }}
+      onMouseEnter={e => { if (!on) e.currentTarget.style.background = '#F5F4F1'; }}
+      onMouseLeave={e => { if (!on) e.currentTarget.style.background = 'transparent'; }}
+      >
+        <span style={{ width: 15, height: 15, borderRadius: 4, border: `1.5px solid ${on ? '#4B6BFB' : '#C8C3BC'}`,
+          background: on ? '#4B6BFB' : '#fff', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          {on && <span style={{ color: '#fff', fontSize: 10, lineHeight: 1 }}>✓</span>}
+        </span>
+        {label || fieldKey}
+      </div>
+    );
+  };
+
+  const count = cardFields.length;
+
+  return (
+    <div ref={ref} style={{ position: 'relative' }}>
+      <button onClick={() => setOpen(o => !o)} style={{
+        ...selectStyle, display: 'flex', alignItems: 'center', gap: 5,
+        borderColor: open ? '#4B6BFB' : '#E4E1DA',
+        background: open ? '#F0F3FF' : '#fff',
+        color: open ? '#4B6BFB' : '#1C1A17',
+      }}>
+        <span>显示字段</span>
+        <span style={{ background: '#4B6BFB', color: '#fff', borderRadius: 10,
+          fontSize: 11, padding: '0 6px', fontWeight: 700 }}>{count}</span>
+        <span style={{ fontSize: 10 }}>▾</span>
+      </button>
+
+      {open && (
+        <div style={{
+          position: 'absolute', top: 'calc(100% + 6px)', left: 0, zIndex: 999,
+          background: '#fff', border: '1px solid #E4E1DA', borderRadius: 10,
+          boxShadow: '0 8px 24px rgba(0,0,0,0.12)', width: 220,
+          maxHeight: 380, display: 'flex', flexDirection: 'column',
+        }}>
+          <div style={{ padding: '8px 8px 4px' }}>
+            <input ref={input} value={query} onChange={e => setQuery(e.target.value)}
+              placeholder="搜索字段…"
+              style={{ width: '100%', boxSizing: 'border-box', padding: '6px 10px',
+                borderRadius: 7, border: '1px solid #E4E1DA', fontSize: 12,
+                fontFamily: 'inherit', outline: 'none' }} />
+          </div>
+          <div style={{ overflowY: 'auto', paddingBottom: 6 }}>
+            {fBuiltin.length > 0 && (<>
+              <SectionLabel>基础信息</SectionLabel>
+              {fBuiltin.map(f => <Item key={f.key} fieldKey={f.key} label={f.label} />)}
+            </>)}
+            {fSummary.length > 0 && (<>
+              <SectionLabel>Summary 指标</SectionLabel>
+              {fSummary.map(k => <Item key={k} fieldKey={k} />)}
+            </>)}
+            {fConfig.length > 0 && (<>
+              <SectionLabel>Config 参数</SectionLabel>
+              {fConfig.map(k => <Item key={k} fieldKey={k} />)}
+            </>)}
+            {fBuiltin.length + fSummary.length + fConfig.length === 0 && (
+              <div style={{ padding: 16, textAlign: 'center', fontSize: 12, color: '#B0A99E' }}>无匹配字段</div>
+            )}
+          </div>
+          <div style={{ borderTop: '1px solid #F0EDE7', padding: '6px 8px', display: 'flex', gap: 6 }}>
+            <button onClick={() => onChangeFields(BUILTIN_FIELDS.map(f => f.key))}
+              style={{ flex: 1, padding: '5px 0', border: '1px solid #E4E1DA', borderRadius: 6,
+                background: '#fff', cursor: 'pointer', fontSize: 11, fontFamily: 'inherit', color: '#6B6560' }}>
+              重置
+            </button>
+            <button onClick={() => setOpen(false)}
+              style={{ flex: 1, padding: '5px 0', border: 'none', borderRadius: 6,
+                background: '#4B6BFB', cursor: 'pointer', fontSize: 11, fontFamily: 'inherit', color: '#fff' }}>
+              完成
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MultiSelectPicker({ label, selected, onChange, options, emptyText = '无选项' }) {
+  const inputRef = useRef(null);
+  const { open, setOpen, query, setQuery, ref } = useFloatingPicker(inputRef);
+
+  const toggle = key => {
+    onChange(selected.includes(key) ? selected.filter(k => k !== key) : [...selected, key]);
+  };
+  const clear = e => { e.stopPropagation(); onChange([]); };
+
+  const q = query.toLowerCase();
+  const filtered = options.filter(o => !q || o.label.toLowerCase().includes(q) || o.key.toLowerCase().includes(q));
+  const count = selected.length;
+  const active = count > 0;
+
+  return (
+    <div ref={ref} style={{ position: 'relative' }}>
+      <button onClick={() => setOpen(o => !o)} style={{
+        ...selectStyle, display: 'flex', alignItems: 'center', gap: 5,
+        borderColor: (open || active) ? '#4B6BFB' : '#E4E1DA',
+        background: open ? '#F0F3FF' : active ? '#EEF1FF' : '#fff',
+        color: open || active ? '#4B6BFB' : '#1C1A17',
+      }}>
+        <span>{label}</span>
+        {active && (
+          <>
+            <span style={{ background: '#4B6BFB', color: '#fff', borderRadius: 10, fontSize: 11, padding: '0 6px', fontWeight: 700 }}>{count}</span>
+            <span onClick={clear} style={{ color: '#4B6BFB', fontSize: 13, lineHeight: 1, opacity: 0.7, cursor: 'pointer' }}>✕</span>
+          </>
+        )}
+        <span style={{ fontSize: 10 }}>▾</span>
+      </button>
+
+      {open && (
+        <div style={{
+          position: 'absolute', top: 'calc(100% + 6px)', left: 0, zIndex: 999,
+          background: '#fff', border: '1px solid #E4E1DA', borderRadius: 10,
+          boxShadow: '0 8px 24px rgba(0,0,0,0.12)', width: 180,
+          maxHeight: 300, display: 'flex', flexDirection: 'column',
+        }}>
+          {options.length > 5 && (
+            <div style={{ padding: '8px 8px 4px' }}>
+              <input ref={inputRef} value={query} onChange={e => setQuery(e.target.value)}
+                placeholder="搜索…"
+                style={{ width: '100%', boxSizing: 'border-box', padding: '6px 10px',
+                  borderRadius: 7, border: '1px solid #E4E1DA', fontSize: 12,
+                  fontFamily: 'inherit', outline: 'none' }} />
+            </div>
+          )}
+          <div style={{ overflowY: 'auto', paddingTop: 4, paddingBottom: 4 }}>
+            {filtered.length === 0 ? (
+              <div style={{ padding: '12px 16px', textAlign: 'center', fontSize: 12, color: '#B0A99E' }}>{emptyText}</div>
+            ) : filtered.map(o => {
+              const on = selected.includes(o.key);
+              return (
+                <div key={o.key} onClick={() => toggle(o.key)} style={{
+                  display: 'flex', alignItems: 'center', gap: 8,
+                  padding: '7px 12px', cursor: 'pointer', borderRadius: 6, margin: '1px 4px',
+                  background: on ? '#EEF1FF' : 'transparent', fontSize: 13,
+                  color: on ? '#4B6BFB' : '#1C1A17', fontWeight: on ? 600 : 400,
+                  transition: 'background 0.1s',
+                }}
+                onMouseEnter={e => { if (!on) e.currentTarget.style.background = '#F5F4F1'; }}
+                onMouseLeave={e => { if (!on) e.currentTarget.style.background = 'transparent'; }}
+                >
+                  <span style={{ width: 15, height: 15, borderRadius: 4, border: `1.5px solid ${on ? '#4B6BFB' : '#C8C3BC'}`,
+                    background: on ? '#4B6BFB' : '#fff', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    {on && <span style={{ color: '#fff', fontSize: 10, lineHeight: 1 }}>✓</span>}
+                  </span>
+                  {o.color && <span style={{ width: 8, height: 8, borderRadius: '50%', background: o.color, flexShrink: 0 }} />}
+                  {o.label}
+                </div>
+              );
+            })}
+          </div>
+          {active && (
+            <div style={{ borderTop: '1px solid #F0EDE7', padding: '6px 8px' }}>
+              <button onClick={() => { onChange([]); setOpen(false); }}
+                style={{ width: '100%', padding: '5px 0', border: '1px solid #E4E1DA', borderRadius: 6,
+                  background: '#fff', cursor: 'pointer', fontSize: 11, fontFamily: 'inherit', color: '#6B6560' }}>
+                清除筛选
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+Object.assign(window, { ListPage });
+</script>
+  <script type="text/babel">// Run Detail Page with Chart.js charts
+const { useState, useEffect, useRef, useCallback } = React;
+
+const LINE_COLORS = [
+  '#4B6BFB','#F59E0B','#10B981','#EF4444','#8B5CF6','#06B6D4','#F97316',
+];
+
+function MetricChart({ history, metricKey, color = '#4B6BFB', label }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+
+  useEffect(() => {
+    if (!canvasRef.current || !history.length) return;
+    const points = history
+      .filter(h => h[metricKey] != null)
+      .map(h => ({ x: h.epoch ?? h._step ?? h._runtime, y: h[metricKey] }))
+      .filter(p => p.x != null);
+    if (!points.length) return;
+
+    if (chartRef.current) chartRef.current.destroy();
+    chartRef.current = new Chart(canvasRef.current, {
+      type: 'line',
+      data: {
+        datasets: [{
+          label: label || metricKey,
+          data: points,
+          borderColor: color,
+          backgroundColor: color + '18',
+          borderWidth: 2,
+          pointRadius: points.length > 80 ? 0 : 3,
+          pointHoverRadius: 5,
+          tension: 0.3,
+          fill: true,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              title: items => `Epoch / Step: ${items[0].parsed.x}`,
+              label: item => `${metricKey}: ${item.parsed.y.toFixed(5)}`,
+            },
+          },
+        },
+        scales: {
+          x: {
+            type: 'linear',
+            title: { display: true, text: 'Epoch / Step', font: { size: 11 }, color: '#9D9890' },
+            grid: { color: '#F3F2EF' },
+            ticks: { color: '#9D9890', font: { size: 11 } },
+          },
+          y: {
+            title: { display: true, text: metricKey, font: { size: 11 }, color: '#9D9890' },
+            grid: { color: '#F3F2EF' },
+            ticks: { color: '#9D9890', font: { size: 11 } },
+          },
+        },
+      },
+    });
+    return () => { if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; } };
+  }, [history, metricKey, color]);
+
+  if (!history.length) return <div style={{ color: '#9D9890', fontSize: 13, padding: 12 }}>暂无历史数据</div>;
+  const hasMetric = history.some(h => h[metricKey] != null);
+  if (!hasMetric) return <div style={{ color: '#9D9890', fontSize: 13, padding: 12 }}>该 metric 无数据</div>;
+
+  return <div style={{ height: 220, position: 'relative' }}><canvas ref={canvasRef} /></div>;
+}
+
+function EditableField({ value, onSave, placeholder, multiline, style: s = {} }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value || '');
+  useEffect(() => { setDraft(value || ''); }, [value]);
+
+  const commit = () => { setEditing(false); onSave(draft.trim()); };
+
+  if (editing) {
+    return multiline ? (
+      <textarea
+        autoFocus value={draft} onChange={e => setDraft(e.target.value)}
+        onBlur={commit}
+        style={{ width: '100%', boxSizing: 'border-box', padding: '6px 10px', borderRadius: 7, border: '1px solid #4B6BFB', fontSize: 14, fontFamily: 'inherit', resize: 'vertical', minHeight: 80, ...s }}
+      />
+    ) : (
+      <input
+        autoFocus value={draft} onChange={e => setDraft(e.target.value)}
+        onBlur={commit} onKeyDown={e => e.key === 'Enter' && commit()}
+        style={{ padding: '4px 8px', borderRadius: 7, border: '1px solid #4B6BFB', fontSize: 16, fontWeight: 700, fontFamily: 'inherit', ...s }}
+      />
+    );
+  }
+
+  return (
+    <span
+      onClick={() => setEditing(true)}
+      title="点击编辑"
+      style={{ cursor: 'text', borderBottom: '1.5px dashed #D1D5DB', ...s }}
+    >
+      {value || <span style={{ color: '#B0A99E', fontStyle: 'italic' }}>{placeholder}</span>}
+    </span>
+  );
+}
+
+function TagEditor({ tags, tagLib, onChangeTags, onChangeTagLib }) {
+  const [input, setInput] = useState('');
+
+  const addTag = name => {
+    const t = name.trim();
+    if (!t || tags.includes(t)) return;
+    const newLib = WBStore.addTagToLib(t);
+    onChangeTagLib(newLib);
+    onChangeTags([...tags, t]);
+    setInput('');
+  };
+
+  const removeTag = t => onChangeTags(tags.filter(x => x !== t));
+
+  const suggestions = tagLib.filter(l => !tags.includes(l.name) && l.name.toLowerCase().includes(input.toLowerCase()));
+
+  return (
+    <div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginBottom: 8 }}>
+        {tags.map(t => <TagChip key={t} tag={t} tagLib={tagLib} onRemove={removeTag} />)}
+      </div>
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+        <input
+          value={input} onChange={e => setInput(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') { addTag(input); e.preventDefault(); } }}
+          placeholder="输入标签后按 Enter"
+          style={{ padding: '5px 10px', borderRadius: 7, border: '1px solid #E4E1DA', fontSize: 13, fontFamily: 'inherit', outline: 'none', width: 160 }}
+        />
+        {suggestions.slice(0, 5).map(s => (
+          <button key={s.name} onClick={() => addTag(s.name)} style={{
+            padding: '4px 10px', borderRadius: 7, border: '1px dashed #D1D5DB',
+            fontSize: 12, background: '#FAFAF8', cursor: 'pointer', fontFamily: 'inherit', color: '#6B6560',
+          }}>+ {s.name}</button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ConfigTable({ config, cmdArgs }) {
+  const [search, setSearch] = useState('');
+  const [useCmd, setUseCmd] = useState(() => WBStore.getUseCommandArgs('_global'));
+  const hasCmdArgs = cmdArgs && Object.keys(cmdArgs).length > 0;
+
+  const merged = useMemo(() => {
+    const base = { ...(useCmd && hasCmdArgs ? cmdArgs : {}), ...config };
+    return base;
+  }, [config, cmdArgs, useCmd, hasCmdArgs]);
+
+  const q = search.toLowerCase();
+  const entries = Object.entries(merged).filter(([k]) => !q || k.toLowerCase().includes(q));
+  const cmdKeys = new Set(cmdArgs ? Object.keys(cmdArgs) : []);
+
+  const handleToggle = val => {
+    setUseCmd(val);
+    WBStore.setUseCommandArgs('_global', val);
+  };
+
+  return (
+    <div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10, flexWrap: 'wrap' }}>
+        <input
+          value={search} onChange={e => setSearch(e.target.value)}
+          placeholder="搜索参数…"
+          style={{ flex: 1, minWidth: 120, padding: '6px 10px', borderRadius: 7, border: '1px solid #E4E1DA', fontSize: 13, fontFamily: 'inherit', outline: 'none' }}
+        />
+        {hasCmdArgs && (
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap' }}>
+            <input type="checkbox" checked={useCmd} onChange={e => handleToggle(e.target.checked)}
+              style={{ width: 13, height: 13, accentColor: '#4B6BFB', cursor: 'pointer' }} />
+            <span style={{ fontSize: 12, color: '#6B6560' }}>
+              合并 Command 参数
+              <span style={{ marginLeft: 4, fontSize: 11, color: '#9D9890' }}>（{Object.keys(cmdArgs).length} 项）</span>
+            </span>
+          </label>
+        )}
+      </div>
+      <div style={{ borderRadius: 8, border: '1px solid #E4E1DA', overflow: 'hidden' }}>
+        {entries.length === 0 ? <div style={{ padding: 16, color: '#9D9890', fontSize: 13 }}>无匹配参数</div> :
+          entries.map(([k, v], i) => {
+            const fromCmd = useCmd && cmdKeys.has(k) && !(k in config);
+            return (
+              <div key={k} style={{
+                display: 'flex', padding: '8px 12px', gap: 16,
+                background: i % 2 === 0 ? '#FAFAF8' : '#fff',
+                borderBottom: i < entries.length - 1 ? '1px solid #F0EDE7' : 'none',
+              }}>
+                <span style={{ fontFamily: 'monospace', fontSize: 12, color: fromCmd ? '#9D9890' : '#4B6BFB', minWidth: 140, flexShrink: 0 }}>{k}</span>
+                <span style={{ fontSize: 13, color: '#1C1A17', wordBreak: 'break-all', flex: 1 }}>
+                  {typeof v === 'object' ? JSON.stringify(v) : String(v ?? '—')}
+                </span>
+                {fromCmd && <span style={{ fontSize: 10, color: '#B0A99E', flexShrink: 0, alignSelf: 'center' }}>CMD</span>}
+              </div>
+            );
+          })
+        }
+      </div>
+    </div>
+  );
+}
+
+function DetailPage({ run, meta, tagLib, onToggleFav, onSaveMeta, onChangeTagLib, onBack, settings }) {
+  const [history, setHistory] = useState([]);
+  const [histLoading, setHistLoading] = useState(false);
+  const [activeTab, setActiveTab] = useState('charts');
+
+  const alias = meta.alias || run.displayName || run.name;
+  const config = parseConfig(run.config || {});
+  const summary = run.summary || {};
+  const metrics = settings.metrics || ['train_loss'];
+  const { apiKey, entity } = settings;
+  const project = run._project || settings.projects?.[0] || '';
+
+  useEffect(() => {
+    if (!apiKey || !entity || !project) return;
+    setHistLoading(true);
+    const summaryKeys = Object.keys(run.summary || {}).filter(k => !k.startsWith('_') && typeof (run.summary||{})[k] === 'number');
+    WBApi.loadHistory(apiKey, entity, project, run.name, 500, summaryKeys)
+      .then(setHistory)
+      .catch(err => { alert('历史数据加载失败：' + err.message); setHistory([]); })
+      .finally(() => setHistLoading(false));
+  }, [run.name]);
+
+  // Detect numeric metrics available in history
+  const availableMetrics = useMemo(() => {
+    if (!history.length) return metrics;
+    const keys = new Set();
+    history.forEach(h => Object.entries(h).forEach(([k, v]) => {
+      if (!k.startsWith('_') && typeof v === 'number') keys.add(k);
+    }));
+    const configured = metrics.filter(m => keys.has(m));
+    const extra = [...keys].filter(k => !metrics.includes(k) && k !== 'epoch');
+    return [...configured, ...extra];
+  }, [history, metrics]);
+
+  const [selectedChartMetrics, setSelectedChartMetrics] = useState(null);
+  React.useEffect(() => {
+    if (availableMetrics.length) setSelectedChartMetrics(availableMetrics.slice(0, 6));
+  }, [run.name]);
+
+  const toggleChartMetric = (m) => setSelectedChartMetrics(prev => {
+    const p = prev || [];
+    return p.includes(m) ? p.filter(x => x !== m) : [...p, m];
+  });
+
+  const visibleMetrics = (selectedChartMetrics || availableMetrics).filter(m => availableMetrics.includes(m));
+
+  const [logs, setLogs] = useState(null);
+  const [logsLoading, setLogsLoading] = useState(false);
+  const [logsError, setLogsError] = useState('');
+  const logsRef = useRef(null);
+
+  const fetchLogs = useCallback(() => {
+    if (!apiKey || !entity || !project) return;
+    setLogsLoading(true); setLogsError('');
+    WBApi.loadLogs(apiKey, entity, project, run.name)
+      .then(text => { setLogs(text); setTimeout(() => { if (logsRef.current) logsRef.current.scrollTop = logsRef.current.scrollHeight; }, 50); })
+      .catch(e => setLogsError(e.message))
+      .finally(() => setLogsLoading(false));
+  }, [run.name, apiKey, entity, project]);
+
+  useEffect(() => { if (activeTab === 'logs' && logs === null && !logsLoading) fetchLogs(); }, [activeTab]);
+
+  const [runMeta, setRunMeta] = useState(null);
+  const [runMetaLoading, setRunMetaLoading] = useState(false);
+  useEffect(() => {
+    if ((activeTab !== 'overview' && activeTab !== 'config') || runMeta !== null || runMetaLoading) return;
+    setRunMetaLoading(true);
+    WBApi.loadMetadata(apiKey, entity, project, run.name)
+      .then(m => {
+        setRunMeta(m || {});
+        if (m?.args?.length) WBStore.setCommandArgs(run.name, parseCommandArgs(m.args));
+      })
+      .catch(() => setRunMeta({}))
+      .finally(() => setRunMetaLoading(false));
+  }, [activeTab]);
+
+  const tabs = ['charts', 'logs', 'overview', 'trainconfig', 'config', 'summary'];
+  const tabLabels = { charts: '训练曲线', logs: 'Logs', overview: '概览', trainconfig: '训练配置', config: 'Config', summary: 'Summary' };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
+      {/* Header */}
+      <div style={{ padding: '12px 16px', borderBottom: '1px solid #E4E1DA', background: '#FAFAF8', flexShrink: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+          <button onClick={onBack} style={{ border: 'none', background: 'none', cursor: 'pointer', fontSize: 20, color: '#6B6560', padding: '0 4px' }}>←</button>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <EditableField
+                value={meta.alias}
+                onSave={v => onSaveMeta({ alias: v })}
+                placeholder={run.displayName || run.name}
+                style={{ fontSize: 17, fontWeight: 700, color: '#1C1A17' }}
+              />
+              <StateBadge state={run.state} />
+              <StarBtn active={!!meta.fav} onClick={() => onToggleFav(run.name)} />
+            </div>
+            <div style={{ fontSize: 11, color: '#B0A99E', fontFamily: 'monospace', marginTop: 2 }}>{run.name} · {fmtTime(run.createdAt)}</div>
+          </div>
+        </div>
+        {/* Tags */}
+        <TagEditor
+          tags={meta.tags || run.tags || []}
+          tagLib={tagLib}
+          onChangeTags={tags => onSaveMeta({ tags })}
+          onChangeTagLib={onChangeTagLib}
+        />
+      </div>
+
+      {/* Notes */}
+      <div style={{ padding: '10px 16px', borderBottom: '1px solid #E4E1DA', background: '#fff', flexShrink: 0 }}>
+        <div style={{ fontSize: 11, color: '#9D9890', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.05em' }}>备注</div>
+        <EditableField
+          value={meta.note}
+          onSave={v => onSaveMeta({ note: v })}
+          placeholder="点击添加备注…"
+          multiline
+          style={{ fontSize: 13, color: '#1C1A17', display: 'block', width: '100%' }}
+        />
+      </div>
+
+      {/* Tabs */}
+      <div style={{ display: 'flex', gap: 0, borderBottom: '1px solid #E4E1DA', background: '#fff', flexShrink: 0 }}>
+        {tabs.map(t => (
+          <button key={t} onClick={() => setActiveTab(t)} style={{
+            padding: '10px 18px', border: 'none', background: 'none',
+            borderBottom: activeTab === t ? '2px solid #4B6BFB' : '2px solid transparent',
+            color: activeTab === t ? '#4B6BFB' : '#6B6560',
+            fontWeight: activeTab === t ? 600 : 400,
+            cursor: 'pointer', fontSize: 13, fontFamily: 'inherit',
+            transition: 'color 0.15s',
+          }}>{tabLabels[t]}</button>
+        ))}
+      </div>
+
+      {/* Tab content */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: 16 }}>
+        {activeTab === 'charts' && (
+          histLoading ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {[1,2].map(i => <Skeleton key={i} height={220} radius={8} />)}
+            </div>
+          ) : history.length === 0 ? (
+            <EmptyState icon="📈" title="暂无训练曲线数据" desc="历史数据未能加载，请检查 API 配置" />
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+              {/* Metric selector */}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {availableMetrics.map(m => {
+                  const on = (selectedChartMetrics || []).includes(m);
+                  return (
+                    <button key={m} onClick={() => toggleChartMetric(m)} style={{
+                      padding: '3px 10px', borderRadius: 20, border: '1px solid',
+                      borderColor: on ? '#4B6BFB' : '#E4E1DA',
+                      background: on ? '#EEF1FF' : '#fff',
+                      color: on ? '#4B6BFB' : '#9D9890',
+                      fontSize: 12, cursor: 'pointer', fontFamily: 'inherit',
+                      fontWeight: on ? 600 : 400,
+                    }}>{on ? '✓ ' : ''}{m}</button>
+                  );
+                })}
+              </div>
+              {/* Charts */}
+              {visibleMetrics.map((m, i) => (
+                <div key={m} style={{ background: '#fff', border: '1px solid #E4E1DA', borderRadius: 10, padding: 16 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: '#1C1A17', marginBottom: 10 }}>{m}</div>
+                  <MetricChart history={history} metricKey={m} color={LINE_COLORS[i % LINE_COLORS.length]} />
+                </div>
+              ))}
+              {visibleMetrics.length === 0 && (
+                <div style={{ textAlign: 'center', color: '#9D9890', fontSize: 13, padding: 40 }}>请在上方选择要显示的指标</div>
+              )}
+            </div>
+          )
+        )}
+
+        {activeTab === 'logs' && (
+          logsLoading ? (
+            <Skeleton height={400} radius={8} />
+          ) : logsError ? (
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, padding: 40 }}>
+              <div style={{ fontSize: 13, color: '#E03131' }}>{logsError}</div>
+              <button onClick={fetchLogs} style={{ padding: '6px 16px', borderRadius: 7, border: '1px solid #E4E1DA', background: '#fff', cursor: 'pointer', fontSize: 13, fontFamily: 'inherit' }}>重试</button>
+            </div>
+          ) : logs === null ? (
+            <EmptyState icon="📋" title="暂无日志" desc="点击加载获取运行日志" />
+          ) : logs.trim() === '' ? (
+            <EmptyState icon="📋" title="日志为空" desc="该 run 的 output.log 没有内容" />
+          ) : (
+            <div style={{ position: 'relative' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                <span style={{ fontSize: 11, color: '#9D9890' }}>{logs.split('\n').length} 行</span>
+                <button onClick={fetchLogs} style={{ border: 'none', background: 'none', cursor: 'pointer', fontSize: 12, color: '#4B6BFB', fontFamily: 'inherit' }}>刷新</button>
+              </div>
+              <div ref={logsRef} style={{
+                background: '#1C1A17', color: '#E8E4DE', borderRadius: 8,
+                padding: '12px 14px', fontFamily: 'monospace', fontSize: 12,
+                lineHeight: 1.7, overflowY: 'auto', maxHeight: 'calc(100vh - 320px)',
+                whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+              }}>
+                {logs}
+              </div>
+              <button onClick={() => { if (logsRef.current) logsRef.current.scrollTop = logsRef.current.scrollHeight; }}
+                style={{ position: 'absolute', bottom: 12, right: 12, border: 'none',
+                  background: 'rgba(75,107,251,0.85)', color: '#fff', borderRadius: 20,
+                  padding: '4px 12px', fontSize: 12, cursor: 'pointer', fontFamily: 'inherit' }}>
+                ↓ 底部
+              </button>
+            </div>
+          )
+        )}
+
+        {activeTab === 'overview' && (runMetaLoading ? <Skeleton height={200} radius={8} /> : (() => {
+          const meta = runMeta || {};
+          const program = meta.program || '';
+          const args = Array.isArray(meta.args) ? meta.args : [];
+          const command = program ? ['python', program, ...args].join(' ') : null;
+          const rows = [
+            command && { label: 'Command', value: command, mono: true },
+            meta.host && { label: 'Host', value: meta.host },
+            meta.os && { label: 'OS', value: meta.os },
+            meta.python && { label: 'Python', value: meta.python },
+            meta.gpu && { label: 'GPU', value: `${meta.gpu}${meta.gpuCount > 1 ? ` × ${meta.gpuCount}` : ''}` },
+            meta.gpuCount && !meta.gpu && { label: 'GPU Count', value: String(meta.gpuCount) },
+            meta.cpu && { label: 'CPU', value: meta.cpu },
+            meta.git?.commit && { label: 'Git Commit', value: meta.git.commit, mono: true },
+            meta.git?.remote && { label: 'Git Remote', value: meta.git.remote, mono: true },
+            meta.codeSaved != null && { label: 'Code Saved', value: meta.codeSaved ? '是' : '否' },
+            run.heartbeatAt && { label: '最后心跳', value: new Date(run.heartbeatAt).toLocaleString() },
+          ].filter(Boolean);
+
+          if (!rows.length) return <EmptyState icon="ℹ️" title="无概览数据" desc="该 run 未上传 metadata" />;
+
+          return (
+            <div style={{ borderRadius: 8, border: '1px solid #E4E1DA', overflow: 'hidden' }}>
+              {rows.map(({ label, value, mono }, i) => (
+                <div key={label} style={{
+                  display: 'flex', alignItems: 'flex-start', gap: 16, padding: '9px 14px',
+                  background: i % 2 === 0 ? '#FAFAF8' : '#fff',
+                  borderBottom: i < rows.length - 1 ? '1px solid #F0EDE7' : 'none',
+                }}>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: '#6B6560', minWidth: 100, flexShrink: 0, paddingTop: 1 }}>{label}</span>
+                  <span style={{
+                    fontSize: 12, color: '#1C1A17', wordBreak: 'break-all', lineHeight: 1.6,
+                    fontFamily: mono ? 'monospace' : 'inherit',
+                    background: mono ? '#F5F4F1' : 'none',
+                    padding: mono ? '2px 6px' : '0',
+                    borderRadius: mono ? 4 : 0,
+                  }}>{value}</span>
+                </div>
+              ))}
+            </div>
+          );
+        })())}
+
+        {activeTab === 'trainconfig' && <CustomConfigTab runName={run.name} />}
+
+        {activeTab === 'config' && (() => {
+          const cmdArgs = WBStore.getCommandArgs(run.name);
+          const isEmpty = Object.keys(config).length === 0 && (!cmdArgs || Object.keys(cmdArgs).length === 0);
+          return isEmpty
+            ? <EmptyState icon="⚙️" title="无 Config 数据" />
+            : <ConfigTable config={config} cmdArgs={cmdArgs} />;
+        })()}
+
+        {activeTab === 'summary' && (
+          <div style={{ borderRadius: 8, border: '1px solid #E4E1DA', overflow: 'hidden' }}>
+            {Object.entries(summary).filter(([k]) => !k.startsWith('_')).map(([k, v], i, arr) => (
+              <div key={k} style={{
+                display: 'flex', padding: '8px 12px', gap: 16,
+                background: i % 2 === 0 ? '#FAFAF8' : '#fff',
+                borderBottom: i < arr.length - 1 ? '1px solid #F0EDE7' : 'none',
+              }}>
+                <span style={{ fontFamily: 'monospace', fontSize: 12, color: '#10B981', minWidth: 140, flexShrink: 0 }}>{k}</span>
+                <span style={{ fontSize: 13, color: '#1C1A17', wordBreak: 'break-all' }}>
+                  {typeof v === 'number' ? v.toFixed(6) : typeof v === 'object' ? JSON.stringify(v) : String(v ?? '—')}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+Object.assign(window, { DetailPage });
+</script>
+  <script type="text/babel">// Compare Page - side-by-side run comparison with param diff + overlaid metric charts
+const { useState, useEffect, useRef, useMemo } = React;
+
+const COMPARE_COLORS = ['#4B6BFB','#F59E0B','#10B981','#EF4444','#8B5CF6'];
+
+function OverlayChart({ datasets, metricKey }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+
+  useEffect(() => {
+    if (!canvasRef.current) return;
+    if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; }
+
+    const chartDatasets = datasets
+      .map(({ run, history, color }) => {
+        const points = history
+          .filter(h => h[metricKey] != null)
+          .map(h => ({ x: h.epoch ?? h._step ?? h._runtime, y: h[metricKey] }))
+          .filter(p => p.x != null);
+        if (!points.length) return null;
+        const alias = (WBStore.getMeta(run.name) || {}).alias || run.displayName || run.name;
+        return {
+          label: alias,
+          data: points,
+          borderColor: color,
+          backgroundColor: color + '15',
+          borderWidth: 2,
+          pointRadius: points.length > 80 ? 0 : 3,
+          tension: 0.3,
+          fill: false,
+        };
+      })
+      .filter(Boolean);
+
+    if (!chartDatasets.length) return;
+
+    chartRef.current = new Chart(canvasRef.current, {
+      type: 'line',
+      data: { datasets: chartDatasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: {
+            display: true,
+            position: 'bottom',
+            labels: { font: { size: 11 }, boxWidth: 12, color: '#6B6560' },
+          },
+          tooltip: {
+            callbacks: {
+              title: items => `Step / Epoch: ${items[0].parsed.x}`,
+            },
+          },
+        },
+        scales: {
+          x: {
+            type: 'linear',
+            title: { display: true, text: 'Epoch / Step', font: { size: 11 }, color: '#9D9890' },
+            grid: { color: '#F3F2EF' },
+            ticks: { color: '#9D9890', font: { size: 11 } },
+          },
+          y: {
+            title: { display: true, text: metricKey, font: { size: 11 }, color: '#9D9890' },
+            grid: { color: '#F3F2EF' },
+            ticks: { color: '#9D9890', font: { size: 11 } },
+          },
+        },
+      },
+    });
+    return () => { if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; } };
+  }, [datasets, metricKey]);
+
+  return <div style={{ height: 260, position: 'relative' }}><canvas ref={canvasRef} /></div>;
+}
+
+function ParamDiffTable({ runs, allConfigs }) {
+  const [showSame, setShowSame] = useState(false);
+  const [search, setSearch] = useState('');
+
+  const allKeys = useMemo(() => {
+    const s = new Set();
+    allConfigs.forEach(c => Object.keys(c).forEach(k => s.add(k)));
+    return [...s].sort();
+  }, [allConfigs]);
+
+  const rows = useMemo(() => {
+    return allKeys
+      .filter(k => k.toLowerCase().includes(search.toLowerCase()))
+      .map(k => {
+        const vals = allConfigs.map(c => {
+          const v = c[k];
+          return v === undefined ? '—' : typeof v === 'object' ? JSON.stringify(v) : String(v);
+        });
+        const same = vals.every(v => v === vals[0]);
+        return { k, vals, same };
+      })
+      .filter(r => showSame || !r.same);
+  }, [allKeys, allConfigs, showSame, search]);
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 12, flexWrap: 'wrap' }}>
+        <input
+          value={search} onChange={e => setSearch(e.target.value)}
+          placeholder="搜索参数…"
+          style={{ padding: '6px 10px', borderRadius: 7, border: '1px solid #E4E1DA', fontSize: 13, fontFamily: 'inherit', outline: 'none', flex: 1, minWidth: 140 }}
+        />
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, color: '#6B6560', cursor: 'pointer', userSelect: 'none' }}>
+          <input type="checkbox" checked={showSame} onChange={e => setShowSame(e.target.checked)} style={{ accentColor: '#4B6BFB' }} />
+          显示相同参数
+        </label>
+        {!showSame && <span style={{ fontSize: 12, color: '#9D9890' }}>只显示差异</span>}
+      </div>
+
+      {rows.length === 0 ? (
+        <div style={{ color: '#9D9890', fontSize: 13, padding: 16, textAlign: 'center' }}>
+          {showSame ? '无参数' : '所有参数相同'}
+        </div>
+      ) : (
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+            <thead>
+              <tr style={{ background: '#F3F2EF' }}>
+                <th style={thStyle}>参数</th>
+                {runs.map((r, i) => {
+                  const alias = (WBStore.getMeta(r.name) || {}).alias || r.displayName || r.name;
+                  return (
+                    <th key={r.name} style={{ ...thStyle, color: COMPARE_COLORS[i] }}>{alias}</th>
+                  );
+                })}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map(({ k, vals, same }, ri) => (
+                <tr key={k} style={{ background: same ? '#fff' : '#FFF7ED' }}>
+                  <td style={{ ...tdStyle, fontFamily: 'monospace', fontSize: 11, color: '#6B6560' }}>{k}</td>
+                  {vals.map((v, i) => (
+                    <td key={i} style={{ ...tdStyle, fontWeight: same ? 400 : 600 }}>{v}</td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SummaryRow({ runs }) {
+  const keys = useMemo(() => {
+    const s = new Set();
+    runs.forEach(r => Object.keys(r.summary || {}).filter(k => !k.startsWith('_')).forEach(k => s.add(k)));
+    return [...s];
+  }, [runs]);
+
+  if (!keys.length) return null;
+
+  return (
+    <div style={{ overflowX: 'auto', marginBottom: 20 }}>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+        <thead>
+          <tr style={{ background: '#F3F2EF' }}>
+            <th style={thStyle}>Metric</th>
+            {runs.map((r, i) => {
+              const alias = (WBStore.getMeta(r.name) || {}).alias || r.displayName || r.name;
+              return <th key={r.name} style={{ ...thStyle, color: COMPARE_COLORS[i] }}>{alias}</th>;
+            })}
+          </tr>
+        </thead>
+        <tbody>
+          {keys.map((k, ri) => (
+            <tr key={k} style={{ background: ri % 2 === 0 ? '#FAFAF8' : '#fff' }}>
+              <td style={{ ...tdStyle, fontFamily: 'monospace', fontSize: 11, color: '#10B981' }}>{k}</td>
+              {runs.map(r => {
+                const v = (r.summary || {})[k];
+                return (
+                  <td key={r.name} style={tdStyle}>
+                    {v == null ? '—' : typeof v === 'number' ? v.toFixed(5) : String(v)}
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ComparePage({ runs, onBack, onOpenRun, settings }) {
+  const [histories, setHistories] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState('charts');
+  const [selectedMetrics, setSelectedMetrics] = useState(null);
+
+  const { apiKey, entity } = settings;
+
+  useEffect(() => {
+    if (!apiKey || !entity || !runs.length) { setLoading(false); return; }
+    let cancelled = false;
+    setLoading(true);
+    Promise.all(runs.map(r => {
+      const project = r._project || settings.projects?.[0] || '';
+      return WBApi.loadHistory(apiKey, entity, project, r.name, 400)
+        .then(h => [r.name, h]);
+    })).then(results => {
+      if (cancelled) return;
+      const map = {};
+      results.forEach(([name, h]) => { map[name] = h; });
+      setHistories(map);
+      setLoading(false);
+    }).catch(() => setLoading(false));
+    return () => { cancelled = true; };
+  }, [runs.map(r => r.name).join(',')]);
+
+  const allConfigs = useMemo(() => runs.map(r => {
+    const cfg = parseConfig(r.config || {});
+    const cmd = WBStore.getCommandArgs(r.name) || {};
+    return { ...cmd, ...cfg };
+  }), [runs]);
+
+  // Detect all available numeric metrics across all histories
+  const availableMetrics = useMemo(() => {
+    const s = new Set();
+    Object.values(histories).forEach(h =>
+      h.forEach(row => Object.entries(row).forEach(([k, v]) => {
+        if (!k.startsWith('_') && k !== 'epoch' && typeof v === 'number') s.add(k);
+      }))
+    );
+    const configured = (settings.metrics || ['train_loss']).filter(m => s.has(m));
+    const rest = [...s].filter(k => !configured.includes(k));
+    return [...configured, ...rest];
+  }, [histories, settings.metrics]);
+
+  useEffect(() => {
+    if (availableMetrics.length && !selectedMetrics) setSelectedMetrics(availableMetrics.slice(0, 3));
+  }, [availableMetrics]);
+
+  const datasets = runs.map((r, i) => ({
+    run: r,
+    history: histories[r.name] || [],
+    color: COMPARE_COLORS[i % COMPARE_COLORS.length],
+  }));
+
+  const tabs = ['charts', 'params', 'trainconfig', 'summary'];
+  const tabLabels = { charts: '曲线对比', params: '参数差异', trainconfig: '配置对比', summary: 'Summary 对比' };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
+      {/* Header */}
+      <div style={{ padding: '12px 16px', borderBottom: '1px solid #E4E1DA', background: '#FAFAF8', flexShrink: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+          <button onClick={onBack} style={{ border: 'none', background: 'none', cursor: 'pointer', fontSize: 20, color: '#6B6560', padding: '0 4px' }}>←</button>
+          <span style={{ fontWeight: 700, fontSize: 16 }}>对比 {runs.length} 条训练</span>
+        </div>
+        {/* Run color legend — click to open detail */}
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          {runs.map((r, i) => {
+            const alias = (WBStore.getMeta(r.name) || {}).alias || r.displayName || r.name;
+            return (
+              <button key={r.name} onClick={() => onOpenRun && onOpenRun(r)}
+                title="点击查看详情"
+                style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13,
+                  border: '1px solid', borderColor: COMPARE_COLORS[i] + '55',
+                  borderRadius: 20, padding: '3px 10px 3px 8px',
+                  background: COMPARE_COLORS[i] + '12',
+                  cursor: onOpenRun ? 'pointer' : 'default',
+                  fontFamily: 'inherit', transition: 'background 0.15s',
+                }}
+                onMouseEnter={e => { if (onOpenRun) e.currentTarget.style.background = COMPARE_COLORS[i] + '28'; }}
+                onMouseLeave={e => e.currentTarget.style.background = COMPARE_COLORS[i] + '12'}
+              >
+                <span style={{ width: 10, height: 10, borderRadius: '50%', background: COMPARE_COLORS[i], flexShrink: 0 }} />
+                <span style={{ color: COMPARE_COLORS[i], fontWeight: 600 }}>{alias}</span>
+                <span style={{ fontSize: 10, color: COMPARE_COLORS[i] + 'AA' }}>↗</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div style={{ display: 'flex', borderBottom: '1px solid #E4E1DA', background: '#fff', flexShrink: 0 }}>
+        {tabs.map(t => (
+          <button key={t} onClick={() => setActiveTab(t)} style={{
+            padding: '10px 18px', border: 'none', background: 'none',
+            borderBottom: activeTab === t ? '2px solid #4B6BFB' : '2px solid transparent',
+            color: activeTab === t ? '#4B6BFB' : '#6B6560',
+            fontWeight: activeTab === t ? 600 : 400,
+            cursor: 'pointer', fontSize: 13, fontFamily: 'inherit',
+          }}>{tabLabels[t]}</button>
+        ))}
+      </div>
+
+      {/* Content */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: 16 }}>
+        {activeTab === 'charts' && (
+          loading ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {[1,2].map(i => <Skeleton key={i} height={280} radius={8} />)}
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {/* Metric selector */}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+                {availableMetrics.map(m => {
+                  const on = (selectedMetrics || []).includes(m);
+                  return (
+                    <button key={m} onClick={() => setSelectedMetrics(prev => {
+                      const p = prev || [];
+                      return on ? p.filter(x => x !== m) : [...p, m];
+                    })} style={{
+                      padding: '4px 10px', borderRadius: 20, fontSize: 12, cursor: 'pointer',
+                      border: on ? '1.5px solid #4B6BFB' : '1px solid #E4E1DA',
+                      background: on ? '#EEF1FF' : '#fff', color: on ? '#4B6BFB' : '#6B6560',
+                      fontFamily: 'inherit', fontWeight: on ? 600 : 400,
+                    }}>{m}</button>
+                  );
+                })}
+              </div>
+              {(selectedMetrics || []).map(m => (
+                <div key={m} style={{ background: '#fff', border: '1px solid #E4E1DA', borderRadius: 10, padding: 16, marginBottom: 10 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10, color: '#1C1A17' }}>{m}</div>
+                  <OverlayChart datasets={datasets} metricKey={m} />
+                </div>
+              ))}
+              {!(selectedMetrics || []).length && (
+                <EmptyState icon="📊" title="请在上方选择要对比的指标" />
+              )}
+            </div>
+          )
+        )}
+
+        {activeTab === 'params' && <ParamDiffTable runs={runs} allConfigs={allConfigs} />}
+
+        {activeTab === 'trainconfig' && (() => {
+          const customConfigs = runs.map(r => {
+            const text = WBStore.getCustomConfig(r.name);
+            if (!text.trim()) return {};
+            try { return flattenJson(JSON.parse(text)); } catch { return {}; }
+          });
+          const hasAny = customConfigs.some(c => Object.keys(c).length > 0);
+          if (!hasAny) return (
+            <EmptyState icon="📄" title="暂无训练配置" desc="请在各训练详情页的「训练配置」tab 中粘贴 JSON 后再对比" />
+          );
+          return <ParamDiffTable runs={runs} allConfigs={customConfigs} />;
+        })()}
+
+        {activeTab === 'summary' && <SummaryRow runs={runs} />}
+      </div>
+    </div>
+  );
+}
+
+const thStyle = { padding: '8px 12px', textAlign: 'left', fontSize: 12, fontWeight: 600, color: '#1C1A17', borderBottom: '1px solid #E4E1DA', whiteSpace: 'nowrap' };
+const tdStyle = { padding: '7px 12px', borderBottom: '1px solid #F0EDE7', color: '#1C1A17', verticalAlign: 'top' };
+
+Object.assign(window, { ComparePage });
+</script>
+  <script type="text/babel">// Main App Shell — routing, settings page, data fetching
+const { useState, useEffect, useCallback, useMemo } = React;
+
+// ─── Settings Page ────────────────────────────────────────────────────────────
+const CF_WORKER_CODE = `export default {
+  async fetch(request) {
+    // CORS preflight
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "POST, OPTIONS",
+          "Access-Control-Allow-Headers": "*",
+          "Access-Control-Max-Age": "86400",
+        },
+      });
+    }
+    // Forward the request to W&B GraphQL API
+    const upstream = await fetch("https://api.wandb.ai/graphql", {
+      method: request.method,
+      headers: {
+        "Authorization": request.headers.get("Authorization") || "",
+        "Content-Type": "application/json",
+        "User-Agent": "wb-logs-proxy/1.0",
+      },
+      body: request.body,
+    });
+    const res = new Response(upstream.body, upstream);
+    res.headers.set("Access-Control-Allow-Origin", "*");
+    return res;
+  }
+};`;
+
+function SettingsPage({ onSaved }) {
+  const init = WBStore.getSettings();
+  const [apiKey,   setApiKey]   = useState(init.apiKey   || '');
+  const [entity,   setEntity]   = useState(init.entity   || '');
+  const [projects, setProjects] = useState((init.projects || []).join(', '));
+  const [metrics,  setMetrics]  = useState((init.metrics  || ['train_loss']).join(', '));
+  const [minEpoch, setMinEpoch] = useState(init.minEpoch ?? 2);
+  const [useProxy, setUseProxy]   = useState(init.useProxy !== false);
+  const [customProxy, setCustomProxy] = useState(init.customProxy || '');
+  const [showWorker,  setShowWorker]  = useState(false);
+  const [testing,  setTesting]  = useState(false);
+  const [testMsg,  setTestMsg]  = useState('');
+  const [copied,   setCopied]   = useState('');
+
+  const save = async (andTest) => {
+    const projectList = projects.split(',').map(s => s.trim()).filter(Boolean);
+    const metricList  = metrics.split(',').map(s => s.trim()).filter(Boolean);
+    WBStore.saveSettings({ apiKey: apiKey.trim(), entity: entity.trim(), projects: projectList, metrics: metricList, minEpoch: Number(minEpoch), useProxy, customProxy: customProxy.trim() });
+    if (!andTest) { onSaved(); return; }
+    if (!apiKey.trim() || !entity.trim() || !projectList.length) {
+      setTestMsg('请填写完整配置'); return;
+    }
+    setTesting(true); setTestMsg('');
+    try {
+      await WBApi.testConnection(apiKey.trim(), entity.trim(), projectList[0], useProxy, customProxy.trim());
+      setTestMsg('✅ 连接成功！');
+      setTimeout(onSaved, 800);
+    } catch (e) {
+      setTestMsg('❌ ' + e.message);
+    } finally { setTesting(false); }
+  };
+
+  const copyText = (key, text) => {
+    navigator.clipboard.writeText(text).then(() => { setCopied(key); setTimeout(() => setCopied(''), 1800); });
+  };
+
+  const [projectList, setProjectList] = useState([]);
+  const [loadingProj, setLoadingProj] = useState(false);
+
+  const browseProjects = async () => {
+    if (!apiKey.trim() || !entity.trim()) { alert('请先填写 API Key 和 Entity'); return; }
+    setLoadingProj(true);
+    try {
+      const list = await WBApi.listProjects(apiKey.trim(), entity.trim(), useProxy, customProxy.trim());
+      setProjectList(list);
+      if (list.length === 0) alert('未找到任何项目，请检查 Entity 名称');
+    } catch (e) {
+      alert('获取项目列表失败：' + e.message);
+    } finally { setLoadingProj(false); }
+  };
+
+  const selectProject = name => {
+    const existing = projects.split(',').map(s => s.trim()).filter(Boolean);
+    if (!existing.includes(name)) setProjects([...existing, name].join(', '));
+  };
+
+  return (
+    <div style={{ maxWidth: 540, margin: '0 auto', padding: '28px 20px 60px', height: '100%', overflowY: 'auto', WebkitOverflowScrolling: 'touch', boxSizing: 'border-box', width: '100%' }}>
+      <div style={{ marginBottom: 22 }}>
+        <div style={{ fontSize: 21, fontWeight: 800, color: '#1C1A17', marginBottom: 3 }}>W&amp;B 日志管理</div>
+        <div style={{ fontSize: 13, color: '#9D9890' }}>连接你的 Weights &amp; Biases 训练数据</div>
+      </div>
+
+      {(<>
+        {[
+          { label: 'API Key', value: apiKey, set: setApiKey, type: 'password', placeholder: '粘贴你的 W&B API Key' },
+          { label: 'Entity（用户名 / 团队）', value: entity, set: setEntity, placeholder: 'your-username' },
+        ].map(({ label, value, set, type, placeholder }) => (
+          <div key={label} style={{ marginBottom: 14 }}>
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#6B6560', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.04em' }}>{label}</label>
+            <input type={type || 'text'} value={value} onChange={e => set(e.target.value)} placeholder={placeholder}
+              style={{ width: '100%', boxSizing: 'border-box', padding: '9px 12px', borderRadius: 8, border: '1px solid #E4E1DA', fontSize: 14, fontFamily: 'inherit', outline: 'none', background: '#fff', color: '#1C1A17' }}
+              onFocus={e => e.target.style.borderColor = '#4B6BFB'}
+              onBlur={e => e.target.style.borderColor = '#E4E1DA'} />
+          </div>
+        ))}
+
+        {/* Projects field with browse */}
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 5 }}>
+            <label style={{ fontSize: 11, fontWeight: 600, color: '#6B6560', textTransform: 'uppercase', letterSpacing: '0.04em' }}>Projects（多个用逗号分隔）</label>
+            <button onClick={browseProjects} disabled={loadingProj} style={{
+              border: 'none', background: 'none', cursor: 'pointer', color: '#4B6BFB',
+              fontSize: 12, padding: 0, fontFamily: 'inherit', fontWeight: 500,
+            }}>{loadingProj ? '加载中…' : '浏览所有项目 →'}</button>
+          </div>
+          <input value={projects} onChange={e => setProjects(e.target.value)} placeholder="project-a, project-b"
+            style={{ width: '100%', boxSizing: 'border-box', padding: '9px 12px', borderRadius: 8, border: '1px solid #E4E1DA', fontSize: 14, fontFamily: 'inherit', outline: 'none', background: '#fff', color: '#1C1A17' }}
+            onFocus={e => e.target.style.borderColor = '#4B6BFB'}
+            onBlur={e => e.target.style.borderColor = '#E4E1DA'} />
+          {projectList.length > 0 && (
+            <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {projectList.map(p => {
+                const selected = projects.split(',').map(s => s.trim()).includes(p.name);
+                return (
+                  <button key={p.name} onClick={() => selectProject(p.name)} style={{
+                    padding: '4px 10px', borderRadius: 20, border: '1px solid',
+                    borderColor: selected ? '#4B6BFB' : '#E4E1DA',
+                    background: selected ? '#EEF1FF' : '#fff',
+                    color: selected ? '#4B6BFB' : '#6B6560',
+                    fontSize: 12, cursor: 'pointer', fontFamily: 'inherit',
+                    fontWeight: selected ? 600 : 400,
+                  }}>
+                    {selected ? '✓ ' : ''}{p.name}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {[
+          { label: '关注的 Metrics（逗号分隔）', value: metrics, set: setMetrics, placeholder: 'train_loss, val_loss' },
+        ].map(({ label, value, set, type, placeholder }) => (
+          <div key={label} style={{ marginBottom: 14 }}>
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#6B6560', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.04em' }}>{label}</label>
+            <input type={type || 'text'} value={value} onChange={e => set(e.target.value)} placeholder={placeholder}
+              style={{ width: '100%', boxSizing: 'border-box', padding: '9px 12px', borderRadius: 8, border: '1px solid #E4E1DA', fontSize: 14, fontFamily: 'inherit', outline: 'none', background: '#fff', color: '#1C1A17' }}
+              onFocus={e => e.target.style.borderColor = '#4B6BFB'}
+              onBlur={e => e.target.style.borderColor = '#E4E1DA'} />
+          </div>
+        ))}
+
+        <div style={{ marginBottom: 16 }}>
+          <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#6B6560', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.04em' }}>最少 Epoch 数</label>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <input type="number" min={1} max={100} value={minEpoch} onChange={e => setMinEpoch(e.target.value)}
+              style={{ width: 72, padding: '9px 12px', borderRadius: 8, border: '1px solid #E4E1DA', fontSize: 14, fontFamily: 'inherit', outline: 'none' }} />
+            <span style={{ fontSize: 13, color: '#9D9890' }}>过滤本次训练不足 {minEpoch} 个 epoch 的记录</span>
+          </div>
+        </div>
+
+      <div style={{ marginBottom: 18, padding: 12, background: '#F9F8F5', borderRadius: 8, border: '1px solid #E4E1DA' }}>
+        <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer', marginBottom: customProxy.trim() ? 0 : 10 }}>
+          <input type="checkbox" checked={useProxy} onChange={e => setUseProxy(e.target.checked)}
+            style={{ marginTop: 2, accentColor: '#4B6BFB', width: 15, height: 15, flexShrink: 0 }} />
+          <div style={{ fontSize: 12, color: '#6B6560', lineHeight: 1.6 }}>
+            <strong>使用公共 CORS 代理</strong>——失败时自动尝试 corsproxy.io / cors.lol / thingproxy。
+            可能因服务限流或 Safari 严格策略失败。
+          </div>
+        </label>
+
+        <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px dashed #E4E1DA' }}>
+          <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#4B6BFB', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+            ⚡ 自定义代理 URL（推荐 · 最可靠）
+          </label>
+          <input value={customProxy} onChange={e => setCustomProxy(e.target.value)}
+            placeholder="https://your-worker.your-name.workers.dev"
+            style={{ width: '100%', boxSizing: 'border-box', padding: '8px 10px', borderRadius: 7, border: '1px solid #E4E1DA', fontSize: 13, fontFamily: 'monospace', outline: 'none', background: '#fff' }} />
+          <button onClick={() => setShowWorker(v => !v)} style={{
+            marginTop: 6, border: 'none', background: 'none', cursor: 'pointer',
+            color: '#4B6BFB', fontSize: 12, padding: 0, fontFamily: 'inherit',
+          }}>{showWorker ? '▾ 隐藏部署说明' : '▸ 30 秒部署你自己的 Cloudflare Worker（免费）'}</button>
+
+          {showWorker && (
+            <div style={{ marginTop: 10, padding: 10, background: '#fff', borderRadius: 6, border: '1px solid #E4E1DA' }}>
+              <ol style={{ paddingLeft: 18, fontSize: 12, color: '#6B6560', lineHeight: 1.9, marginBottom: 8 }}>
+                <li>登录 <a href="https://dash.cloudflare.com" target="_blank" rel="noreferrer" style={{ color: '#4B6BFB' }}>dash.cloudflare.com</a> → Workers &amp; Pages → Create</li>
+                <li>选 "Hello World"，进入 Edit code，把下面代码全部替换进去</li>
+                <li>点 Save and Deploy，复制顶部的 *.workers.dev URL 粘贴到上方</li>
+              </ol>
+              <div style={{ position: 'relative' }}>
+                <pre style={{
+                  background: '#1C1A17', color: '#E8E4DE', borderRadius: 6,
+                  padding: '10px 12px', fontSize: 11, overflowX: 'auto',
+                  lineHeight: 1.6, margin: 0, fontFamily: 'monospace',
+                  maxHeight: 200,
+                }}>{CF_WORKER_CODE}</pre>
+                <button onClick={() => copyText('cf', CF_WORKER_CODE)} style={{
+                  position: 'absolute', top: 6, right: 6,
+                  padding: '3px 9px', borderRadius: 5, border: 'none',
+                  background: copied === 'cf' ? '#10B981' : '#333', color: '#fff',
+                  fontSize: 11, cursor: 'pointer', fontFamily: 'inherit',
+                }}>{copied === 'cf' ? '✓' : '复制'}</button>
+              </div>
+              <div style={{ marginTop: 8, fontSize: 11, color: '#9D9890', lineHeight: 1.6 }}>
+                ✅ 免费版每天 100k 请求，绰绰有余<br />
+                🔒 API Key 只经过你自己的 Worker，不暴露给第三方
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+          <Btn onClick={() => save(true)} disabled={testing}>
+          {testing ? '测试中…' : '测试并保存'}
+        </Btn>
+        <Btn variant="subtle" onClick={() => save(false)}>直接保存</Btn>
+        {testMsg && <span style={{ fontSize: 13, color: testMsg.startsWith('✅') ? '#15803D' : '#DC2626' }}>{testMsg}</span>}
+      </div>
+
+      <div style={{ marginTop: 20, padding: 12, background: '#F3F2EF', borderRadius: 8, fontSize: 12, color: '#9D9890', lineHeight: 1.6 }}>
+        <strong style={{ color: '#6B6560' }}>提示：</strong>API Key 可在 <a href="https://wandb.ai/settings" target="_blank" rel="noreferrer" style={{ color: '#4B6BFB' }}>wandb.ai/settings</a> 获取。数据仅存于本地浏览器。
+      </div>
+    </>)}
+    </div>
+  );
+}
+
+// ─── Nav ──────────────────────────────────────────────────────────────────────
+const NAV_ITEMS = [
+  { key: 'list',     icon: '📋', label: '训练列表' },
+  { key: 'favs',     icon: '⭐', label: '收藏'     },
+  { key: 'compare',  icon: '📊', label: '对比'     },
+  { key: 'settings', icon: '⚙️', label: '设置'     },
+];
+
+function Sidebar({ page, onNav, compareCount }) {
+  return (
+    <div style={{ width: 200, borderRight: '1px solid #E4E1DA', background: '#FAFAF8', display: 'flex', flexDirection: 'column', flexShrink: 0 }}>
+      <div style={{ padding: '20px 16px 12px', borderBottom: '1px solid #E4E1DA' }}>
+        <div style={{ fontWeight: 800, fontSize: 17, color: '#1C1A17', letterSpacing: '-0.02em' }}>W&amp;B Logs</div>
+        <div style={{ fontSize: 11, color: '#B0A99E', marginTop: 2 }}>训练日志管理</div>
+      </div>
+      <nav style={{ flex: 1, padding: '10px 8px' }}>
+        {NAV_ITEMS.map(({ key, icon, label }) => (
+          <button key={key} onClick={() => onNav(key)} style={{
+            display: 'flex', alignItems: 'center', gap: 10,
+            width: '100%', padding: '9px 12px', borderRadius: 8,
+            border: 'none', background: page === key ? '#EEF1FF' : 'transparent',
+            color: page === key ? '#4B6BFB' : '#6B6560',
+            fontWeight: page === key ? 600 : 400,
+            cursor: 'pointer', fontSize: 14, fontFamily: 'inherit',
+            textAlign: 'left', marginBottom: 2,
+            transition: 'background 0.12s',
+          }}>
+            <span style={{ fontSize: 16 }}>{icon}</span>
+            <span style={{ flex: 1 }}>{label}</span>
+            {key === 'compare' && compareCount > 0 && (
+              <span style={{ background: '#4B6BFB', color: '#fff', borderRadius: 10, fontSize: 11, padding: '1px 6px', fontWeight: 700 }}>{compareCount}</span>
+            )}
+          </button>
+        ))}
+      </nav>
+    </div>
+  );
+}
+
+function BottomNav({ page, onNav, compareCount }) {
+  return (
+    <div style={{ display: 'flex', borderTop: '1px solid #E4E1DA', background: '#FAFAF8', flexShrink: 0 }}>
+      {NAV_ITEMS.map(({ key, icon, label }) => (
+        <button key={key} onClick={() => onNav(key)} style={{
+          flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center',
+          padding: '8px 4px', border: 'none',
+          background: 'transparent',
+          color: page === key ? '#4B6BFB' : '#9D9890',
+          cursor: 'pointer', fontFamily: 'inherit', position: 'relative',
+        }}>
+          <span style={{ fontSize: 20, lineHeight: 1.2 }}>{icon}</span>
+          <span style={{ fontSize: 10, fontWeight: page === key ? 600 : 400, marginTop: 2 }}>{label}</span>
+          {key === 'compare' && compareCount > 0 && (
+            <span style={{ position: 'absolute', top: 6, right: '50%', transform: 'translateX(8px)', background: '#4B6BFB', color: '#fff', borderRadius: 10, fontSize: 10, padding: '0 5px', fontWeight: 700 }}>{compareCount}</span>
+          )}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ─── Root App ─────────────────────────────────────────────────────────────────
+function App() {
+  const [page, setPage]               = useState('list');
+  const [runs, setRuns]               = useState([]);
+  const [allMeta, setAllMeta]         = useState(WBStore.getAllMeta());
+  const [tagLib, setTagLib]           = useState(WBStore.getTagLib());
+  const [loading, setLoading]         = useState(false);
+  const [loadMsg, setLoadMsg]         = useState('');
+  const [error, setError]             = useState('');
+  const [compareSelected, setCompare] = useState([]);
+  const [detailRun, setDetailRun]     = useState(null);
+  const [isMobile, setIsMobile]       = useState(window.innerWidth < 768);
+
+  const settings = WBStore.getSettings();
+  const hasConfig = !!(settings.apiKey && settings.entity && settings.projects?.length);
+
+  useEffect(() => {
+    const onResize = () => setIsMobile(window.innerWidth < 768);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  const refreshMeta = useCallback(() => setAllMeta(WBStore.getAllMeta()), []);
+  const refreshTagLib = useCallback(lib => setTagLib(lib || WBStore.getTagLib()), []);
+
+  const loadRuns = useCallback(async () => {
+    const s = WBStore.getSettings();
+    if (!s.apiKey || !s.entity || !s.projects?.length) return;
+    setLoading(true); setError('');
+    try {
+      const raw = await WBApi.loadAllRunsMulti(s.apiKey, s.entity, s.projects, (n, t, proj) => {
+        setLoadMsg(`加载中 ${proj}… ${n}/${t}`);
+      });
+      const minEpoch = s.minEpoch ?? 2;
+      const valid = raw.filter(r => {
+        const count = getEpochCount(r);
+        return count !== null && count >= minEpoch;
+      });
+      setRuns(valid);
+      setLoadMsg('');
+    } catch (e) {
+      setError(e.message);
+    } finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => {
+    if (hasConfig) loadRuns();
+    else setPage('settings');
+  }, []);
+
+  const handleToggleFav = useCallback(runName => {
+    WBStore.toggleFav(runName);
+    refreshMeta();
+  }, [refreshMeta]);
+
+  const handleSaveMeta = useCallback((runName, patch) => {
+    WBStore.patchMeta(runName, patch);
+    refreshMeta();
+  }, [refreshMeta]);
+
+  const handleToggleCompare = useCallback(run => {
+    setCompare(prev => {
+      const exists = prev.some(r => r.name === run.name);
+      if (exists) return prev.filter(r => r.name !== run.name);
+      if (prev.length >= 5) return prev;
+      return [...prev, run];
+    });
+  }, []);
+
+  // Bridge for ListPage floating bar
+  window.__goCompare    = () => setPage('compare');
+  window.__clearCompare = () => setCompare([]);
+
+  const handleNav = key => {
+    setDetailRun(null);
+    setPage(key);
+    if (key === 'settings') return;
+    if (!runs.length && !loading && hasConfig) loadRuns();
+  };
+
+  const metrics = settings.metrics || ['train_loss'];
+
+  // ── Render ──
+  const mainContent = () => {
+    if (page === 'settings') {
+      return <SettingsPage
+        onSaved={() => { refreshMeta(); setPage('list'); loadRuns(); }}
+      />;
+    }
+
+    if (loading) {
+      return (
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', gap: 16, color: '#9D9890' }}>
+          <div style={{ fontSize: 36 }}>⏳</div>
+          <div style={{ fontSize: 14 }}>{loadMsg || '加载中…'}</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '80%', maxWidth: 320 }}>
+            {[1,2,3,4].map(i => <Skeleton key={i} height={80} radius={10} />)}
+          </div>
+        </div>
+      );
+    }
+
+    if (error) {
+      return (
+        <EmptyState icon="⚠️" title="加载失败" desc={error}>
+          <Btn onClick={loadRuns}>重试</Btn>
+          <Btn variant="subtle" onClick={() => setPage('settings')} style={{ marginLeft: 8 }}>检查配置</Btn>
+        </EmptyState>
+      );
+    }
+
+    if (detailRun) {
+      return (
+        <DetailPage
+          run={detailRun}
+          meta={allMeta[detailRun.name] || {}}
+          tagLib={tagLib}
+          settings={settings}
+          onToggleFav={handleToggleFav}
+          onSaveMeta={patch => handleSaveMeta(detailRun.name, patch)}
+          onChangeTagLib={refreshTagLib}
+          onBack={() => setDetailRun(null)}
+        />
+      );
+    }
+
+    if (page === 'compare') {
+      if (compareSelected.length < 2) {
+        return <EmptyState icon="📊" title="请先选择至少 2 条训练进行对比" desc="在列表页开启对比模式，勾选训练后回到此页">
+          <Btn onClick={() => setPage('list')}>去列表页</Btn>
+        </EmptyState>;
+      }
+      return (
+        <ComparePage
+          runs={compareSelected}
+          settings={settings}
+          onBack={() => setPage('list')}
+          onOpenRun={run => setDetailRun(run)}
+        />
+      );
+    }
+
+    return (
+      <ListPage
+        runs={runs}
+        allMeta={allMeta}
+        tagLib={tagLib}
+        onToggleFav={handleToggleFav}
+        onOpenRun={run => setDetailRun(run)}
+        compareSelected={compareSelected}
+        onToggleCompare={handleToggleCompare}
+        favOnly={page === 'favs'}
+        metrics={metrics}
+      />
+    );
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: isMobile ? 'column' : 'row', height: '100dvh', fontFamily: "'Inter', system-ui, sans-serif", background: '#F9F8F5', overflow: 'hidden' }}>
+      {!isMobile && <Sidebar page={detailRun ? '' : page} onNav={handleNav} compareCount={compareSelected.length} />}
+
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0 }}>
+        {/* Mobile top bar */}
+        {isMobile && (
+          <div style={{ padding: '12px 16px', borderBottom: '1px solid #E4E1DA', background: '#FAFAF8', display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+            <span style={{ fontWeight: 800, fontSize: 15, color: '#1C1A17', flex: 1 }}>W&amp;B Logs</span>
+            <button onClick={loadRuns} disabled={loading} style={{ border: 'none', background: 'none', cursor: 'pointer', fontSize: 18, color: '#9D9890', padding: 4 }} title="刷新">↻</button>
+          </div>
+        )}
+
+        {/* Refresh button (desktop) */}
+        {!isMobile && page !== 'settings' && !detailRun && (
+          <div style={{ padding: '8px 16px', borderBottom: '1px solid #E4E1DA', background: '#fff', display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+            <span style={{ flex: 1, fontSize: 12, color: '#9D9890' }}>
+              {runs.length} 条有效训练（本次训练 ≥{settings.minEpoch ?? 2} epoch）
+            </span>
+            <button onClick={loadRuns} disabled={loading} style={{ border: '1px solid #E4E1DA', background: '#fff', cursor: 'pointer', borderRadius: 7, padding: '5px 12px', fontSize: 12, color: '#6B6560', fontFamily: 'inherit' }}>
+              {loading ? '加载中…' : '↻ 刷新'}
+            </button>
+          </div>
+        )}
+
+        <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+          {mainContent()}
+        </div>
+
+        {isMobile && <BottomNav page={detailRun ? '' : page} onNav={handleNav} compareCount={compareSelected.length} />}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
