@@ -30,47 +30,27 @@ const WBApi = (() => {
     return 'Basic ' + btoa(apiKey + ':');
   }
 
-  // Try multiple proxy strategies in sequence
-  async function gqlWithProxy(apiKey, query, variables, useProxy, customProxyOverride) {
+  async function gqlWithProxy(apiKey, query, variables, _unused, customProxyOverride) {
     const customProxy = (customProxyOverride !== undefined ? customProxyOverride : (WBStore.getSettings().customProxy || '')).trim();
-    const proxies = [];
-    if (customProxy) {
-      // Custom proxy (e.g. Cloudflare Worker) — try first; expects to forward POST to W&B GraphQL
-      proxies.push(() => customProxy.replace(/\/$/, ''));
+    if (!customProxy) throw new Error('请先在设置中填写本地代理地址（运行 proxy.py 后填入 http://localhost:8080）');
+    const endpoint = customProxy.replace(/\/$/, '');
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Authorization': authHeader(apiKey),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ query, variables }),
+    });
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      if (res.status === 401) msg = 'API Key 无效，请检查';
+      if (res.status === 403) msg = '无权访问，请确认 Entity / Project 名称';
+      throw new Error(msg);
     }
-    if (useProxy) {
-      proxies.push(url => `https://corsproxy.io/?url=${encodeURIComponent(url)}`);
-      proxies.push(url => `https://api.cors.lol/?url=${encodeURIComponent(url)}`);
-      proxies.push(url => `https://thingproxy.freeboard.io/fetch/${url}`);
-    }
-    // No direct fallback — would always fail due to CORS
-
-    let lastErr;
-    for (const proxyFn of proxies) {
-      const endpoint = proxyFn(GQL);
-      try {
-        const res = await fetch(endpoint, {
-          method: 'POST',
-          headers: {
-            'Authorization': authHeader(apiKey),
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ query, variables }),
-        });
-        if (!res.ok) {
-          let msg = `HTTP ${res.status}`;
-          if (res.status === 401) msg = 'API Key 无效，请检查';
-          if (res.status === 403) msg = '无权访问，请确认 Entity / Project 名称';
-          throw new Error(msg);
-        }
-        const json = await res.json();
-        if (json.errors) throw new Error(json.errors.map(e => e.message).join('; '));
-        return json.data;
-      } catch (e) {
-        lastErr = e;
-      }
-    }
-    throw new Error(lastErr?.message || '所有代理均失败，请检查代理配置');
+    const json = await res.json();
+    if (json.errors) throw new Error(json.errors.map(e => e.message).join('; '));
+    return json.data;
   }
 
   const RUNS_QUERY = `
@@ -97,15 +77,11 @@ const WBApi = (() => {
     return { ...node, config, summary };
   }
 
-  function getUseProxy() {
-    return WBStore.getSettings().useProxy !== false;
-  }
 
   async function loadAllRuns(apiKey, entity, project, onProgress) {
-    const useProxy = getUseProxy();
     let all = [], after = null, hasNext = true;
     while (hasNext) {
-      const data = await gqlWithProxy(apiKey, RUNS_QUERY, { entity, project, first: 100, after }, useProxy);
+      const data = await gqlWithProxy(apiKey, RUNS_QUERY, { entity, project, first: 100, after });
       if (!data.project) throw new Error(`找不到项目 "${project}"，请检查 Entity 和 Project 名称`);
       const { edges, pageInfo } = data.project.runs;
       const runs = edges.map(e => parseRun(e.node));
@@ -140,8 +116,7 @@ const WBApi = (() => {
   `;
 
   async function loadHistory(apiKey, entity, project, runName, samples = 400, summaryKeys = []) {
-    const useProxy = getUseProxy();
-    const data = await gqlWithProxy(apiKey, HISTORY_QUERY, { entity, project, runName }, useProxy);
+    const data = await gqlWithProxy(apiKey, HISTORY_QUERY, { entity, project, runName });
     const raw = data?.project?.run?.history;
     if (!raw || !Array.isArray(raw)) return [];
     return raw
@@ -149,13 +124,13 @@ const WBApi = (() => {
       .sort((a, b) => (a._step ?? 0) - (b._step ?? 0));
   }
 
-  async function testConnection(apiKey, entity, project, useProxy = true, customProxyOverride) {
-    const data = await gqlWithProxy(apiKey, RUNS_QUERY, { entity, project, first: 1 }, useProxy, customProxyOverride);
+  async function testConnection(apiKey, entity, project, _unused, customProxyOverride) {
+    const data = await gqlWithProxy(apiKey, RUNS_QUERY, { entity, project, first: 1 }, null, customProxyOverride);
     if (!data.project) throw new Error(`找不到项目 "${project}"`);
     return data;
   }
 
-  async function listProjects(apiKey, entity, useProxy = true, customProxyOverride) {
+  async function listProjects(apiKey, entity, _unused, customProxyOverride) {
     // Step 1: resolve actual entity name and teams from API key
     const viewerQuery = `
       query {
@@ -165,7 +140,7 @@ const WBApi = (() => {
         }
       }
     `;
-    const vd = await gqlWithProxy(apiKey, viewerQuery, {}, useProxy, customProxyOverride);
+    const vd = await gqlWithProxy(apiKey, viewerQuery, {}, null, customProxyOverride);
     if (!vd.viewer) throw new Error('API Key 无效，无法获取用户信息');
 
     const entities = new Set();
@@ -184,7 +159,7 @@ const WBApi = (() => {
     const seen = new Set();
     const all = [];
     for (const ent of entities) {
-      const d = await gqlWithProxy(apiKey, modelsQuery, { entity: ent }, useProxy, customProxyOverride);
+      const d = await gqlWithProxy(apiKey, modelsQuery, { entity: ent }, null, customProxyOverride);
       (d.models?.edges || []).forEach(e => {
         if (!seen.has(e.node.name)) { seen.add(e.node.name); all.push(e.node); }
       });
@@ -195,7 +170,6 @@ const WBApi = (() => {
   }
 
   async function loadLogs(apiKey, entity, project, runName) {
-    const useProxy = getUseProxy();
     // directUrl returns a pre-signed S3/GCS link — no auth header needed
     const query = `
       query($entity: String!, $project: String!, $runName: String!) {
@@ -208,7 +182,7 @@ const WBApi = (() => {
         }
       }
     `;
-    const data = await gqlWithProxy(apiKey, query, { entity, project, runName }, useProxy);
+    const data = await gqlWithProxy(apiKey, query, { entity, project, runName });
     const edges = data?.project?.run?.files?.edges || [];
     if (!edges.length) return null; // run has no output.log
 
@@ -238,7 +212,7 @@ const WBApi = (() => {
         }
       }
     `;
-    const data = await gqlWithProxy(apiKey, query, { entity, project, runName }, useProxy);
+    const data = await gqlWithProxy(apiKey, query, { entity, project, runName });
     const edges = data?.project?.run?.files?.edges || [];
     if (!edges.length) return null;
     const fileUrl = edges[0].node.directUrl;
@@ -2214,35 +2188,6 @@ Object.assign(window, { ComparePage });
 const { useState, useEffect, useCallback, useMemo } = React;
 
 // ─── Settings Page ────────────────────────────────────────────────────────────
-const CF_WORKER_CODE = `export default {
-  async fetch(request) {
-    // CORS preflight
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "POST, OPTIONS",
-          "Access-Control-Allow-Headers": "*",
-          "Access-Control-Max-Age": "86400",
-        },
-      });
-    }
-    // Forward the request to W&B GraphQL API
-    const upstream = await fetch("https://api.wandb.ai/graphql", {
-      method: request.method,
-      headers: {
-        "Authorization": request.headers.get("Authorization") || "",
-        "Content-Type": "application/json",
-        "User-Agent": "wb-logs-proxy/1.0",
-      },
-      body: request.body,
-    });
-    const res = new Response(upstream.body, upstream);
-    res.headers.set("Access-Control-Allow-Origin", "*");
-    return res;
-  }
-};`;
-
 function SettingsPage({ onSaved }) {
   const init = WBStore.getSettings();
   const [apiKey,   setApiKey]   = useState(init.apiKey   || '');
@@ -2250,9 +2195,7 @@ function SettingsPage({ onSaved }) {
   const [projects, setProjects] = useState((init.projects || []).join(', '));
   const [metrics,  setMetrics]  = useState((init.metrics  || ['train_loss']).join(', '));
   const [minEpoch, setMinEpoch] = useState(init.minEpoch ?? 2);
-  const [useProxy, setUseProxy]   = useState(init.useProxy !== false);
   const [customProxy, setCustomProxy] = useState(init.customProxy || '');
-  const [showWorker,  setShowWorker]  = useState(false);
   const [testing,  setTesting]  = useState(false);
   const [testMsg,  setTestMsg]  = useState('');
   const [copied,   setCopied]   = useState('');
@@ -2260,14 +2203,14 @@ function SettingsPage({ onSaved }) {
   const save = async (andTest) => {
     const projectList = projects.split(',').map(s => s.trim()).filter(Boolean);
     const metricList  = metrics.split(',').map(s => s.trim()).filter(Boolean);
-    WBStore.saveSettings({ apiKey: apiKey.trim(), entity: entity.trim(), projects: projectList, metrics: metricList, minEpoch: Number(minEpoch), useProxy, customProxy: customProxy.trim() });
+    WBStore.saveSettings({ apiKey: apiKey.trim(), entity: entity.trim(), projects: projectList, metrics: metricList, minEpoch: Number(minEpoch), customProxy: customProxy.trim() });
     if (!andTest) { onSaved(); return; }
     if (!apiKey.trim() || !entity.trim() || !projectList.length) {
       setTestMsg('请填写完整配置'); return;
     }
     setTesting(true); setTestMsg('');
     try {
-      await WBApi.testConnection(apiKey.trim(), entity.trim(), projectList[0], useProxy, customProxy.trim());
+      await WBApi.testConnection(apiKey.trim(), entity.trim(), projectList[0], null, customProxy.trim());
       setTestMsg('✅ 连接成功！');
       setTimeout(onSaved, 800);
     } catch (e) {
@@ -2286,7 +2229,7 @@ function SettingsPage({ onSaved }) {
     if (!apiKey.trim() || !entity.trim()) { alert('请先填写 API Key 和 Entity'); return; }
     setLoadingProj(true);
     try {
-      const list = await WBApi.listProjects(apiKey.trim(), entity.trim(), useProxy, customProxy.trim());
+      const list = await WBApi.listProjects(apiKey.trim(), entity.trim(), null, customProxy.trim());
       setProjectList(list);
       if (list.length === 0) alert('未找到任何项目，请检查 Entity 名称');
     } catch (e) {
@@ -2376,54 +2319,18 @@ function SettingsPage({ onSaved }) {
         </div>
 
       <div style={{ marginBottom: 18, padding: 12, background: '#F9F8F5', borderRadius: 8, border: '1px solid #E4E1DA' }}>
-        <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer', marginBottom: customProxy.trim() ? 0 : 10 }}>
-          <input type="checkbox" checked={useProxy} onChange={e => setUseProxy(e.target.checked)}
-            style={{ marginTop: 2, accentColor: '#4B6BFB', width: 15, height: 15, flexShrink: 0 }} />
-          <div style={{ fontSize: 12, color: '#6B6560', lineHeight: 1.6 }}>
-            <strong>使用公共 CORS 代理</strong>——失败时自动尝试 corsproxy.io / cors.lol / thingproxy。
-            可能因服务限流或 Safari 严格策略失败。
-          </div>
+        <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#4B6BFB', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+          本地代理地址
         </label>
-
-        <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px dashed #E4E1DA' }}>
-          <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#4B6BFB', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-            ⚡ 自定义代理 URL（推荐 · 最可靠）
-          </label>
-          <input value={customProxy} onChange={e => setCustomProxy(e.target.value)}
-            placeholder="https://your-worker.your-name.workers.dev"
-            style={{ width: '100%', boxSizing: 'border-box', padding: '8px 10px', borderRadius: 7, border: '1px solid #E4E1DA', fontSize: 13, fontFamily: 'monospace', outline: 'none', background: '#fff' }} />
-          <button onClick={() => setShowWorker(v => !v)} style={{
-            marginTop: 6, border: 'none', background: 'none', cursor: 'pointer',
-            color: '#4B6BFB', fontSize: 12, padding: 0, fontFamily: 'inherit',
-          }}>{showWorker ? '▾ 隐藏部署说明' : '▸ 30 秒部署你自己的 Cloudflare Worker（免费）'}</button>
-
-          {showWorker && (
-            <div style={{ marginTop: 10, padding: 10, background: '#fff', borderRadius: 6, border: '1px solid #E4E1DA' }}>
-              <ol style={{ paddingLeft: 18, fontSize: 12, color: '#6B6560', lineHeight: 1.9, marginBottom: 8 }}>
-                <li>登录 <a href="https://dash.cloudflare.com" target="_blank" rel="noreferrer" style={{ color: '#4B6BFB' }}>dash.cloudflare.com</a> → Workers &amp; Pages → Create</li>
-                <li>选 "Hello World"，进入 Edit code，把下面代码全部替换进去</li>
-                <li>点 Save and Deploy，复制顶部的 *.workers.dev URL 粘贴到上方</li>
-              </ol>
-              <div style={{ position: 'relative' }}>
-                <pre style={{
-                  background: '#1C1A17', color: '#E8E4DE', borderRadius: 6,
-                  padding: '10px 12px', fontSize: 11, overflowX: 'auto',
-                  lineHeight: 1.6, margin: 0, fontFamily: 'monospace',
-                  maxHeight: 200,
-                }}>{CF_WORKER_CODE}</pre>
-                <button onClick={() => copyText('cf', CF_WORKER_CODE)} style={{
-                  position: 'absolute', top: 6, right: 6,
-                  padding: '3px 9px', borderRadius: 5, border: 'none',
-                  background: copied === 'cf' ? '#10B981' : '#333', color: '#fff',
-                  fontSize: 11, cursor: 'pointer', fontFamily: 'inherit',
-                }}>{copied === 'cf' ? '✓' : '复制'}</button>
-              </div>
-              <div style={{ marginTop: 8, fontSize: 11, color: '#9D9890', lineHeight: 1.6 }}>
-                ✅ 免费版每天 100k 请求，绰绰有余<br />
-                🔒 API Key 只经过你自己的 Worker，不暴露给第三方
-              </div>
-            </div>
-          )}
+        <input value={customProxy} onChange={e => setCustomProxy(e.target.value)}
+          placeholder="http://localhost:8080"
+          style={{ width: '100%', boxSizing: 'border-box', padding: '8px 10px', borderRadius: 7, border: '1px solid #E4E1DA', fontSize: 13, fontFamily: 'monospace', outline: 'none', background: '#fff' }} />
+        <div style={{ marginTop: 8, fontSize: 12, color: '#6B6560', lineHeight: 1.7 }}>
+          需先在本地运行代理脚本以解决浏览器 CORS 限制：
+          <pre style={{ margin: '6px 0 0', padding: '6px 10px', background: '#1C1A17', color: '#E8E4DE',
+            borderRadius: 6, fontSize: 12, fontFamily: 'monospace', display: 'inline-block' }}>
+            python proxy.py</pre>
+          <span style={{ marginLeft: 8, color: '#9D9890', fontSize: 11 }}>（随项目附带，无需额外安装）</span>
         </div>
       </div>
 
