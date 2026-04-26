@@ -1,6 +1,7 @@
 # W&B Logs Management
 
 A lightweight single-file web app for browsing and comparing your [Weights & Biases](https://wandb.ai) training runs — no cloud, no install, runs entirely in your browser.
+<img width="2500" height="1276" alt="58654da30baf805d8ff52673bec169c1" src="https://github.com/user-attachments/assets/b55f7dd7-6955-40ea-9222-c43b113c1b6a" />
 
 **[▶ Open Online](https://matchayou.github.io/WB-Logs-Management)**
 
