@@ -6,9 +6,69 @@ W&B 本地 CORS 代理 — 零外部依赖，只用标准库
 """
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import urllib.request, ssl, json, sys
+from pathlib import Path
 
 PORT = 8080
 TARGET = "https://api.wandb.ai/graphql"
+COMPARE_FILE = Path(__file__).parent / "compare_sessions.json"
+SETTINGS_FILE = Path(__file__).parent / "app_settings.json"
+ANNOTATIONS_FILE = Path(__file__).parent / "run_annotations.json"
+
+def load_compare_sessions():
+    if not COMPARE_FILE.exists():
+        return []
+    try:
+        data = json.loads(COMPARE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+def save_compare_sessions(sessions):
+    COMPARE_FILE.write_text(
+        json.dumps(sessions, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+def load_app_settings():
+    if not SETTINGS_FILE.exists():
+        return {}
+    try:
+        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def save_app_settings(settings):
+    SETTINGS_FILE.write_text(
+        json.dumps(settings, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+def load_run_annotations():
+    if not ANNOTATIONS_FILE.exists():
+        return {"version": 1, "runs": {}, "tagLibrary": []}
+    try:
+        data = json.loads(ANNOTATIONS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"version": 1, "runs": {}, "tagLibrary": []}
+        return {
+            "version": data.get("version", 1),
+            "runs": data.get("runs", {}) if isinstance(data.get("runs", {}), dict) else {},
+            "tagLibrary": data.get("tagLibrary", []) if isinstance(data.get("tagLibrary", []), list) else [],
+        }
+    except Exception:
+        return {"version": 1, "runs": {}, "tagLibrary": []}
+
+def save_run_annotations(annotations):
+    payload = {
+        "version": annotations.get("version", 1),
+        "runs": annotations.get("runs", {}),
+        "tagLibrary": annotations.get("tagLibrary", []),
+    }
+    ANNOTATIONS_FILE.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 class Handler(BaseHTTPRequestHandler):
     def _cors(self):
@@ -18,7 +78,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Credentials", "true")
-        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
     def do_OPTIONS(self):
@@ -29,6 +89,60 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body   = self.rfile.read(length)
+        if self.path == "/compare-sessions":
+            try:
+                parsed = json.loads(body or b"[]")
+                if not isinstance(parsed, list):
+                    raise ValueError("compare sessions payload must be a list")
+                save_compare_sessions(parsed)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self._cors()
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": True, "count": len(parsed)}).encode())
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self._cors()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
+        if self.path == "/app-settings":
+            try:
+                parsed = json.loads(body or b"{}")
+                if not isinstance(parsed, dict):
+                    raise ValueError("app settings payload must be an object")
+                save_app_settings(parsed)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self._cors()
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": True}).encode())
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self._cors()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
+        if self.path == "/run-annotations":
+            try:
+                parsed = json.loads(body or b"{}")
+                if not isinstance(parsed, dict):
+                    raise ValueError("run annotations payload must be an object")
+                save_run_annotations(parsed)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self._cors()
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": True}).encode())
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self._cors()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
         try:
             parsed = json.loads(body)
             print(f"  [variables] {json.dumps(parsed.get('variables', {}))}")
@@ -73,6 +187,30 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         from urllib.parse import urlparse, parse_qs
+        if self.path == "/compare-sessions":
+            sessions = load_compare_sessions()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self._cors()
+            self.end_headers()
+            self.wfile.write(json.dumps(sessions, ensure_ascii=False).encode("utf-8"))
+            return
+        if self.path == "/app-settings":
+            settings = load_app_settings()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self._cors()
+            self.end_headers()
+            self.wfile.write(json.dumps(settings, ensure_ascii=False).encode("utf-8"))
+            return
+        if self.path == "/run-annotations":
+            annotations = load_run_annotations()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self._cors()
+            self.end_headers()
+            self.wfile.write(json.dumps(annotations, ensure_ascii=False).encode("utf-8"))
+            return
         params = parse_qs(urlparse(self.path).query)
         target = params.get('url', [None])[0]
         if not target:

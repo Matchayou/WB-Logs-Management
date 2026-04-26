@@ -266,34 +266,183 @@ const WBApi = (() => {
   return { testConnection, loadAllRuns, loadAllRunsMulti, loadHistory, loadLogs, loadMetadata, listProjects };
 })();
 </script>
-  <script>// localStorage persistence layer
+  <script>// local file + localStorage persistence layer
 const WBStore = (() => {
   const KEY = 'wb_log_v1';
+  const state = {
+    settings: {},
+    runs: {},
+    tagLib: [],
+    commandArgs: {},
+    initialized: false,
+  };
 
-  const load = () => {
+  const loadLegacy = () => {
     try { return JSON.parse(localStorage.getItem(KEY) || '{}'); } catch { return {}; }
   };
-  const commit = d => localStorage.setItem(KEY, JSON.stringify(d));
+  const commitLegacy = d => localStorage.setItem(KEY, JSON.stringify(d));
 
-  // Settings
-  const getSettings = () => load().settings || {};
+  function getProxyBase() {
+    const settings = state.settings?.customProxy ? state.settings : (loadLegacy().settings || {});
+    const proxy = (settings.customProxy || '').trim();
+    return proxy ? proxy.replace(/\/$/, '') : '';
+  }
+
+  async function readJson(path) {
+    const proxyBase = getProxyBase();
+    if (!proxyBase) throw new Error('Missing local proxy URL');
+    const res = await fetch(`${proxyBase}${path}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  async function writeJson(path, payload) {
+    const proxyBase = getProxyBase();
+    if (!proxyBase) throw new Error('Missing local proxy URL');
+    const res = await fetch(`${proxyBase}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      try {
+        const data = await res.json();
+        if (data?.error) msg = data.error;
+      } catch {}
+      throw new Error(msg);
+    }
+  }
+
+  function legacyToRunAnnotations(legacy) {
+    const runs = { ...(legacy.runs || {}) };
+    Object.entries(legacy.customConfigs || {}).forEach(([id, customConfig]) => {
+      runs[id] = { ...(runs[id] || {}), customConfig };
+    });
+    return {
+      version: 1,
+      runs,
+      tagLibrary: legacy.tagLib || [],
+    };
+  }
+
+  function normalizeRunAnnotations(data = {}) {
+    return {
+      version: data.version || 1,
+      runs: typeof data.runs === 'object' && data.runs ? data.runs : {},
+      tagLibrary: Array.isArray(data.tagLibrary) ? data.tagLibrary : [],
+    };
+  }
+
+  function mergeSettings(fileSettings, legacySettings) {
+    return { ...(legacySettings || {}), ...(fileSettings || {}) };
+  }
+
+  function mergeRunAnnotations(fileData, legacyData) {
+    const fileRuns = fileData.runs || {};
+    const legacyRuns = legacyData.runs || {};
+    return {
+      version: 1,
+      runs: { ...legacyRuns, ...fileRuns },
+      tagLibrary: [
+        ...(legacyData.tagLibrary || []),
+        ...(fileData.tagLibrary || []),
+      ].filter((tag, idx, arr) => arr.findIndex(t => t.name === tag.name) === idx),
+    };
+  }
+
+  async function persistSettings() {
+    const payload = { ...state.settings };
+    await writeJson('/app-settings', payload);
+  }
+
+  async function persistRunAnnotations() {
+    const payload = { version: 1, runs: state.runs, tagLibrary: state.tagLib };
+    await writeJson('/run-annotations', payload);
+  }
+
+  function mirrorLegacy() {
+    const legacy = loadLegacy();
+    const settings = { ...(legacy.settings || {}), ...state.settings };
+    settings.useCommandArgsMap = settings.useCommandArgsMap || {};
+    const customConfigs = {};
+    Object.entries(state.runs).forEach(([id, entry]) => {
+      if (entry.customConfig) customConfigs[id] = entry.customConfig;
+    });
+    commitLegacy({
+      ...legacy,
+      settings,
+      runs: state.runs,
+      tagLib: state.tagLib,
+      customConfigs,
+      commandArgs: state.commandArgs,
+      migration: { ...(legacy.migration || {}), fileStorageV2: true },
+    });
+  }
+
+  async function init() {
+    const legacy = loadLegacy();
+    state.settings = { ...(legacy.settings || {}) };
+    state.runs = { ...(legacy.runs || {}) };
+    state.tagLib = [...(legacy.tagLib || [])];
+    state.commandArgs = { ...(legacy.commandArgs || {}) };
+
+    const proxyBase = getProxyBase();
+    if (!proxyBase) {
+      state.initialized = true;
+      mirrorLegacy();
+      return;
+    }
+
+    let fileSettings = {};
+    let fileAnnotations = { version: 1, runs: {}, tagLibrary: [] };
+    try { fileSettings = await readJson('/app-settings'); } catch {}
+    try { fileAnnotations = normalizeRunAnnotations(await readJson('/run-annotations')); } catch {}
+
+    const mergedSettings = mergeSettings(fileSettings, legacy.settings || {});
+    const mergedAnnotations = mergeRunAnnotations(fileAnnotations, legacyToRunAnnotations(legacy));
+
+    state.settings = mergedSettings;
+    state.runs = mergedAnnotations.runs;
+    state.tagLib = mergedAnnotations.tagLibrary;
+
+    const migrated = !!legacy.migration?.fileStorageV2;
+    const fileHadSettings = Object.keys(fileSettings || {}).length > 0;
+    const fileHadAnnotations = Object.keys(fileAnnotations.runs || {}).length > 0 || (fileAnnotations.tagLibrary || []).length > 0;
+    if (!migrated || !fileHadSettings || !fileHadAnnotations) {
+      try { await persistSettings(); } catch {}
+      try { await persistRunAnnotations(); } catch {}
+    }
+
+    state.initialized = true;
+    mirrorLegacy();
+  }
+
+  const getSettings = () => state.settings || {};
   const saveSettings = patch => {
-    const d = load(); d.settings = { ...d.settings, ...patch }; commit(d);
+    state.settings = { ...state.settings, ...patch };
+    mirrorLegacy();
+    persistSettings().catch(console.error);
   };
 
-  // Per-run metadata (alias, tags, notes, fav)
-  const getMeta = id => (load().runs || {})[id] || {};
-  const patchMeta = (id, patch) => {
-    const d = load();
-    if (!d.runs) d.runs = {};
-    d.runs[id] = { ...d.runs[id], ...patch };
-    commit(d);
+  const getMeta = id => {
+    const { customConfig, ...meta } = state.runs[id] || {};
+    return meta;
   };
-  const getAllMeta = () => load().runs || {};
+  const patchMeta = (id, patch) => {
+    state.runs[id] = { ...state.runs[id], ...patch };
+    mirrorLegacy();
+    persistRunAnnotations().catch(console.error);
+  };
+  const getAllMeta = () => Object.fromEntries(
+    Object.entries(state.runs).map(([id, entry]) => {
+      const { customConfig, ...meta } = entry || {};
+      return [id, meta];
+    })
+  );
 
   const toggleFav = id => {
-    const m = getMeta(id);
-    const next = !m.fav;
+    const next = !getMeta(id).fav;
     patchMeta(id, { fav: next });
     return next;
   };
@@ -301,9 +450,12 @@ const WBStore = (() => {
   const setTags  = (id, tags)  => patchMeta(id, { tags });
   const setNote  = (id, note)  => patchMeta(id, { note });
 
-  // Tag library: [{name, colorIdx}]
-  const getTagLib  = () => load().tagLib || [];
-  const saveTagLib = tags => { const d = load(); d.tagLib = tags; commit(d); };
+  const getTagLib  = () => state.tagLib || [];
+  const saveTagLib = tags => {
+    state.tagLib = tags;
+    mirrorLegacy();
+    persistRunAnnotations().catch(console.error);
+  };
 
   const addTagToLib = name => {
     const lib = getTagLib();
@@ -313,55 +465,34 @@ const WBStore = (() => {
     return next;
   };
 
-  const getCustomConfig = id => (load().customConfigs || {})[id] || '';
+  const getCustomConfig = id => state.runs[id]?.customConfig || '';
   const setCustomConfig = (id, text) => {
-    const d = load();
-    if (!d.customConfigs) d.customConfigs = {};
-    d.customConfigs[id] = text;
-    commit(d);
+    state.runs[id] = { ...state.runs[id], customConfig: text };
+    mirrorLegacy();
+    persistRunAnnotations().catch(console.error);
   };
 
-  const getCommandArgs = id => (load().commandArgs || {})[id] ?? null;
+  const getCommandArgs = id => state.commandArgs[id] ?? null;
   const setCommandArgs = (id, obj) => {
-    const d = load();
-    if (!d.commandArgs) d.commandArgs = {};
-    d.commandArgs[id] = obj;
-    commit(d);
+    state.commandArgs[id] = obj;
+    mirrorLegacy();
   };
 
   const getUseCommandArgs = id => {
-    const m = (load().settings || {}).useCommandArgsMap || {};
+    const m = state.settings.useCommandArgsMap || {};
     return m[id] !== false;
   };
   const setUseCommandArgs = (id, val) => {
-    const d = load();
-    if (!d.settings) d.settings = {};
-    d.settings.useCommandArgsMap = { ...(d.settings.useCommandArgsMap || {}), [id]: val };
-    commit(d);
-  };
-
-  const getCompareSessions = () => load().compareSessions || [];
-  const saveCompareSessions = sessions => {
-    const d = load();
-    d.compareSessions = sessions;
-    commit(d);
-  };
-  const upsertCompareSession = session => {
-    const list = getCompareSessions();
-    const idx = list.findIndex(x => x.id === session.id);
-    const next = idx >= 0
-      ? [...list.slice(0, idx), session, ...list.slice(idx + 1)]
-      : [session, ...list];
-    saveCompareSessions(next);
-    return next;
-  };
-  const deleteCompareSession = id => {
-    const next = getCompareSessions().filter(x => x.id !== id);
-    saveCompareSessions(next);
-    return next;
+    state.settings = {
+      ...state.settings,
+      useCommandArgsMap: { ...(state.settings.useCommandArgsMap || {}), [id]: val },
+    };
+    mirrorLegacy();
+    persistSettings().catch(console.error);
   };
 
   return {
+    init,
     getSettings, saveSettings,
     getMeta, patchMeta, getAllMeta,
     toggleFav, setAlias, setTags, setNote,
@@ -369,8 +500,57 @@ const WBStore = (() => {
     getCustomConfig, setCustomConfig,
     getCommandArgs, setCommandArgs,
     getUseCommandArgs, setUseCommandArgs,
-    getCompareSessions, saveCompareSessions, upsertCompareSession, deleteCompareSession,
   };
+})();
+
+const WBCompareStore = (() => {
+  const endpoint = () => {
+    const proxyBase = (WBStore.getSettings().customProxy || '').replace(/\/$/, '');
+    if (!proxyBase) throw new Error('Please set the local proxy URL in Settings first.');
+    return `${proxyBase}/compare-sessions`;
+  };
+
+  async function getCompareSessions() {
+    const res = await fetch(endpoint());
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  }
+
+  async function saveCompareSessions(sessions) {
+    const res = await fetch(endpoint(), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sessions),
+    });
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      try {
+        const data = await res.json();
+        if (data?.error) msg = data.error;
+      } catch {}
+      throw new Error(msg);
+    }
+    return sessions;
+  }
+
+  async function upsertCompareSession(session) {
+    const list = await getCompareSessions();
+    const idx = list.findIndex(x => x.id === session.id);
+    const next = idx >= 0
+      ? [...list.slice(0, idx), session, ...list.slice(idx + 1)]
+      : [session, ...list];
+    await saveCompareSessions(next);
+    return next;
+  }
+
+  async function deleteCompareSession(id) {
+    const next = (await getCompareSessions()).filter(x => x.id !== id);
+    await saveCompareSessions(next);
+    return next;
+  }
+
+  return { getCompareSessions, saveCompareSessions, upsertCompareSession, deleteCompareSession };
 })();
 </script>
 </head>
@@ -488,6 +668,8 @@ const I18N = {
     save: '保存',
     cancel: '取消',
     compareRecordSaved: '对比记录已保存',
+    compareRecordLoadFailed: ({ error }) => `对比记录加载失败：${error}`,
+    compareRecordSaveFailed: ({ error }) => `对比记录保存失败：${error}`,
     noCompareRecords: '暂无对比记录',
     noCompareRecordsHint: '在对比页保存一次对比后，这里会显示记录',
     openRecord: '打开记录',
@@ -646,6 +828,8 @@ const I18N = {
     save: 'Save',
     cancel: 'Cancel',
     compareRecordSaved: 'Compare record saved',
+    compareRecordLoadFailed: ({ error }) => `Failed to load compare records: ${error}`,
+    compareRecordSaveFailed: ({ error }) => `Failed to save compare records: ${error}`,
     noCompareRecords: 'No compare records yet',
     noCompareRecordsHint: 'Saved comparisons will appear here',
     openRecord: 'Open',
@@ -2706,8 +2890,8 @@ function ComparePage({ runs, onBack, onOpenRun, settings, onSaveSession, onOpenH
         open={saveOpen}
         runs={runs}
         onClose={() => setSaveOpen(false)}
-        onSave={(payload) => {
-          onSaveSession(payload);
+        onSave={async (payload) => {
+          await onSaveSession(payload);
           setSaveOpen(false);
           alert(t('compareRecordSaved', {}, lang));
         }}
@@ -2994,11 +3178,12 @@ function BottomNav({ page, onNav, compareCount }) {
 // ─── Root App ─────────────────────────────────────────────────────────────────
 function App() {
   const [settingsVersion, setSettingsVersion] = useState(0);
+  const [booting, setBooting] = useState(true);
   const [page, setPage]               = useState('list');
   const [runs, setRuns]               = useState([]);
   const [allMeta, setAllMeta]         = useState(WBStore.getAllMeta());
   const [tagLib, setTagLib]           = useState(WBStore.getTagLib());
-  const [compareSessions, setCompareSessions] = useState(WBStore.getCompareSessions());
+  const [compareSessions, setCompareSessions] = useState([]);
   const [loading, setLoading]         = useState(false);
   const [loadMsg, setLoadMsg]         = useState('');
   const [error, setError]             = useState('');
@@ -3009,6 +3194,19 @@ function App() {
   const settings = useMemo(() => WBStore.getSettings(), [settingsVersion]);
   const lang = settings.language === 'en' ? 'en' : 'zh';
   const hasConfig = !!(settings.apiKey && settings.entity && settings.projects?.length);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      await WBStore.init();
+      if (cancelled) return;
+      setAllMeta(WBStore.getAllMeta());
+      setTagLib(WBStore.getTagLib());
+      setSettingsVersion(v => v + 1);
+      setBooting(false);
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     const onResize = () => setIsMobile(window.innerWidth < 768);
@@ -3023,7 +3221,18 @@ function App() {
 
   const refreshMeta = useCallback(() => setAllMeta(WBStore.getAllMeta()), []);
   const refreshTagLib = useCallback(lib => setTagLib(lib || WBStore.getTagLib()), []);
-  const refreshCompareSessions = useCallback(() => setCompareSessions(WBStore.getCompareSessions()), []);
+  const refreshCompareSessions = useCallback(async () => {
+    if (!WBStore.getSettings().customProxy) {
+      setCompareSessions([]);
+      return;
+    }
+    try {
+      setCompareSessions(await WBCompareStore.getCompareSessions());
+    } catch (e) {
+      alert(t('compareRecordLoadFailed', { error: e.message }, getLang()));
+      setCompareSessions([]);
+    }
+  }, []);
 
   const loadRuns = useCallback(async () => {
     const s = WBStore.getSettings();
@@ -3046,9 +3255,18 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (booting) return;
     if (hasConfig) loadRuns();
     else setPage('settings');
-  }, []);
+  }, [booting, hasConfig, loadRuns]);
+
+  useEffect(() => {
+    refreshCompareSessions();
+  }, [refreshCompareSessions]);
+
+  useEffect(() => {
+    if (!booting) refreshCompareSessions();
+  }, [booting, settingsVersion, refreshCompareSessions]);
 
   const handleToggleFav = useCallback(runName => {
     WBStore.toggleFav(runName);
@@ -3060,9 +3278,10 @@ function App() {
     refreshMeta();
   }, [refreshMeta]);
 
-  const handleSaveCompareSession = useCallback(({ title, comment }) => {
+  const handleSaveCompareSession = useCallback(async ({ title, comment }) => {
     const now = new Date().toISOString();
-    WBStore.upsertCompareSession({
+    try {
+      await WBCompareStore.upsertCompareSession({
       id: `cmp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
       title,
       comment,
@@ -3075,12 +3294,16 @@ function App() {
         project: r._project || settings.projects?.[0] || '',
         alias: (WBStore.getMeta(r.name) || {}).alias || r.displayName || r.name,
       })),
-    });
-    refreshCompareSessions();
-  }, [compareSelected, settings.allowCrossProjectCompare, settings.projects, refreshCompareSessions]);
+      });
+      await refreshCompareSessions();
+    } catch (e) {
+      alert(t('compareRecordSaveFailed', { error: e.message }, lang));
+      throw e;
+    }
+  }, [compareSelected, settings.allowCrossProjectCompare, settings.projects, refreshCompareSessions, lang]);
 
-  const handleOpenCompareSession = useCallback((sessionId) => {
-    const session = WBStore.getCompareSessions().find(x => x.id === sessionId);
+  const handleOpenCompareSession = useCallback(async (sessionId) => {
+    const session = compareSessions.find(x => x.id === sessionId);
     if (!session) return;
     const restored = session.runRefs
       .map(ref => runs.find(r => r.name === ref.name && ((r._project || settings.projects?.[0] || '') === (ref.project || ''))))
@@ -3091,17 +3314,23 @@ function App() {
       alert(t('recordNeedTwoRuns', {}, lang));
       return;
     }
-    WBStore.upsertCompareSession({ ...session, lastOpenedAt: new Date().toISOString() });
-    refreshCompareSessions();
+    try {
+      await WBCompareStore.upsertCompareSession({ ...session, lastOpenedAt: new Date().toISOString() });
+      await refreshCompareSessions();
+    } catch {}
     setCompare(restored);
     setDetailRun(null);
     setPage('compare');
-  }, [runs, settings.projects, lang, refreshCompareSessions]);
+  }, [compareSessions, runs, settings.projects, lang, refreshCompareSessions]);
 
-  const handleDeleteCompareSession = useCallback((sessionId) => {
-    WBStore.deleteCompareSession(sessionId);
-    refreshCompareSessions();
-  }, [refreshCompareSessions]);
+  const handleDeleteCompareSession = useCallback(async (sessionId) => {
+    try {
+      await WBCompareStore.deleteCompareSession(sessionId);
+      await refreshCompareSessions();
+    } catch (e) {
+      alert(t('compareRecordSaveFailed', { error: e.message }, lang));
+    }
+  }, [refreshCompareSessions, lang]);
 
   const handleToggleCompare = useCallback(run => {
     setCompare(prev => {
@@ -3143,9 +3372,27 @@ function App() {
 
   // ── Render ──
   const mainContent = () => {
+    if (booting) {
+      return (
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', gap: 16, color: '#9D9890' }}>
+          <div style={{ fontSize: 36 }}>⏳</div>
+          <div style={{ fontSize: 14 }}>{t('loading', {}, lang)}</div>
+        </div>
+      );
+    }
+
     if (page === 'settings') {
       return <SettingsPage
-        onSaved={() => { setSettingsVersion(v => v + 1); refreshMeta(); refreshCompareSessions(); setPage('list'); loadRuns(); }}
+        onSaved={async () => {
+          await WBStore.init();
+          setAllMeta(WBStore.getAllMeta());
+          setTagLib(WBStore.getTagLib());
+          setSettingsVersion(v => v + 1);
+          refreshMeta();
+          refreshCompareSessions();
+          setPage('list');
+          loadRuns();
+        }}
         onLanguageChange={() => setSettingsVersion(v => v + 1)}
       />;
     }

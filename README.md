@@ -12,10 +12,11 @@ A lightweight single-file web app for browsing and comparing your [Weights & Bia
 - Browse runs across multiple W&B projects in one place
 - Training curves, Config, Summary, Logs, and Overview tabs per run
 - Compare runs side-by-side (charts, params diff, custom config)
+- Save compare records with comments and reopen them later
 - Multi-select tag & state filters, per-project sort/field preferences
 - Command-line args auto-parsed into Config view
 - Bilingual UI: switch between Chinese and English in Settings
-- All data stays local — nothing is stored outside your browser
+- Local annotations and settings are stored in project-side JSON files via the local proxy
 
 ---
 
@@ -32,6 +33,8 @@ python proxy.py
 ```
 
 4. In Settings → set **Custom Proxy URL** to `http://localhost:8080`
+
+Note: compare records, run annotations, and app settings that need file persistence require the local proxy.
 
 ---
 
@@ -57,10 +60,15 @@ Set **Custom Proxy URL** to `http://localhost:8080` in Settings on first run.
 | `index.html` | The entire app (single file, no build step) |
 | `proxy.py` | Local CORS proxy (stdlib only, no pip install) |
 | `run.py` | One-click launcher: starts proxy + opens browser |
+| `app_settings.json` | Local app settings persisted next to the project |
+| `run_annotations.json` | Local run notes, tags, favorites, aliases, and custom configs |
+| `compare_sessions.json` | Saved compare records and comments |
+
+These JSON files are ignored by git via `.gitignore` so local data is not committed by default.
 
 ---
 
 ## W&B API Key
 
 Get your key at [wandb.ai/settings](https://wandb.ai/settings).  
-It is stored only in your browser's `localStorage` and never sent anywhere except directly to `api.wandb.ai` via the local proxy.
+It is sent only to `api.wandb.ai` through the local proxy. When file persistence is enabled, app settings are also stored locally in `app_settings.json` on your machine.
