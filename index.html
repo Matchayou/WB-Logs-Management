@@ -340,6 +340,27 @@ const WBStore = (() => {
     commit(d);
   };
 
+  const getCompareSessions = () => load().compareSessions || [];
+  const saveCompareSessions = sessions => {
+    const d = load();
+    d.compareSessions = sessions;
+    commit(d);
+  };
+  const upsertCompareSession = session => {
+    const list = getCompareSessions();
+    const idx = list.findIndex(x => x.id === session.id);
+    const next = idx >= 0
+      ? [...list.slice(0, idx), session, ...list.slice(idx + 1)]
+      : [session, ...list];
+    saveCompareSessions(next);
+    return next;
+  };
+  const deleteCompareSession = id => {
+    const next = getCompareSessions().filter(x => x.id !== id);
+    saveCompareSessions(next);
+    return next;
+  };
+
   return {
     getSettings, saveSettings,
     getMeta, patchMeta, getAllMeta,
@@ -348,6 +369,7 @@ const WBStore = (() => {
     getCustomConfig, setCustomConfig,
     getCommandArgs, setCommandArgs,
     getUseCommandArgs, setUseCommandArgs,
+    getCompareSessions, saveCompareSessions, upsertCompareSession, deleteCompareSession,
   };
 })();
 </script>
@@ -423,6 +445,7 @@ const I18N = {
     runList: '训练列表',
     favorites: '收藏',
     compare: '对比',
+    compareRecords: '对比记录',
     pasteApiKey: '粘贴你的 W&B API Key',
     entityLabel: 'Entity（用户名 / 团队）',
     projectsLabel: 'Projects（多个用逗号分隔）',
@@ -453,6 +476,26 @@ const I18N = {
     compareNeedRuns: '请先选择至少 2 条训练进行对比',
     compareNeedRunsHint: '在列表页开启对比模式，勾选训练后回到此页',
     goList: '去列表页',
+    allowCrossProjectCompare: '允许跨项目对比',
+    allowCrossProjectCompareHint: '勾选后可跨项目选择训练做对比；不勾选时只能比较同一项目下的训练',
+    saveCompareRecord: '保存记录',
+    saveCurrentCompare: '保存当前对比',
+    openCompareRecords: '查看记录',
+    compareRecordTitle: '记录标题',
+    compareRecordComment: 'Comments',
+    compareRecordTitlePlaceholder: '例如：baseline vs aug',
+    compareRecordCommentPlaceholder: '记录这次对比的结论、关注点或后续动作…',
+    save: '保存',
+    cancel: '取消',
+    compareRecordSaved: '对比记录已保存',
+    noCompareRecords: '暂无对比记录',
+    noCompareRecordsHint: '在对比页保存一次对比后，这里会显示记录',
+    openRecord: '打开记录',
+    deleteRecord: '删除',
+    recordRuns: ({ count }) => `${count} 个训练`,
+    recordMissingRuns: ({ missing, total }) => `记录中的训练有缺失：${missing}/${total} 个不可用`,
+    recordNeedTwoRuns: '可恢复的训练少于 2 个，无法打开该记录',
+    savedAt: '保存于',
     loadProgress: ({ project, current, total }) => `加载中 ${project}… ${current}/${total}`,
     detailCharts: '训练曲线',
     detailOverview: '概览',
@@ -560,6 +603,7 @@ const I18N = {
     runList: 'Runs',
     favorites: 'Favorites',
     compare: 'Compare',
+    compareRecords: 'Compare Records',
     pasteApiKey: 'Paste your W&B API key',
     entityLabel: 'Entity (user / team)',
     projectsLabel: 'Projects (comma-separated)',
@@ -590,6 +634,26 @@ const I18N = {
     compareNeedRuns: 'Select at least 2 runs before comparing',
     compareNeedRunsHint: 'Enable compare mode in the run list, select runs, then come back here',
     goList: 'Go to run list',
+    allowCrossProjectCompare: 'Allow cross-project compare',
+    allowCrossProjectCompareHint: 'When enabled, selected runs can come from different projects. When disabled, comparison is limited to a single project.',
+    saveCompareRecord: 'Save Record',
+    saveCurrentCompare: 'Save current compare',
+    openCompareRecords: 'View records',
+    compareRecordTitle: 'Record title',
+    compareRecordComment: 'Comments',
+    compareRecordTitlePlaceholder: 'Example: baseline vs aug',
+    compareRecordCommentPlaceholder: 'Write conclusions, observations, or next actions for this comparison…',
+    save: 'Save',
+    cancel: 'Cancel',
+    compareRecordSaved: 'Compare record saved',
+    noCompareRecords: 'No compare records yet',
+    noCompareRecordsHint: 'Saved comparisons will appear here',
+    openRecord: 'Open',
+    deleteRecord: 'Delete',
+    recordRuns: ({ count }) => `${count} runs`,
+    recordMissingRuns: ({ missing, total }) => `Some runs in this record are missing: ${missing}/${total} unavailable`,
+    recordNeedTwoRuns: 'Fewer than 2 runs could be restored, so this record cannot be opened',
+    savedAt: 'Saved',
     loadProgress: ({ project, current, total }) => `Loading ${project}… ${current}/${total}`,
     detailCharts: 'Charts',
     detailOverview: 'Overview',
@@ -2369,12 +2433,112 @@ function SummaryRow({ runs }) {
   );
 }
 
-function ComparePage({ runs, onBack, onOpenRun, settings }) {
+function SaveCompareModal({ open, runs, onClose, onSave }) {
+  const lang = getLang();
+  const defaultTitle = runs.map(r => (WBStore.getMeta(r.name) || {}).alias || r.displayName || r.name).slice(0, 3).join(' vs ');
+  const [title, setTitle] = useState(defaultTitle);
+  const [comment, setComment] = useState('');
+
+  useEffect(() => {
+    if (!open) return;
+    setTitle(defaultTitle);
+    setComment('');
+  }, [open, defaultTitle]);
+
+  return (
+    <Modal open={open} onClose={onClose} title={t('saveCurrentCompare', {}, lang)} width={520}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+        <div>
+          <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#6B6560', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+            {t('compareRecordTitle', {}, lang)}
+          </label>
+          <input
+            value={title}
+            onChange={e => setTitle(e.target.value)}
+            placeholder={t('compareRecordTitlePlaceholder', {}, lang)}
+            style={{ width: '100%', boxSizing: 'border-box', padding: '9px 12px', borderRadius: 8, border: '1px solid #E4E1DA', fontSize: 14, fontFamily: 'inherit', outline: 'none' }}
+          />
+        </div>
+        <div>
+          <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#6B6560', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+            {t('compareRecordComment', {}, lang)}
+          </label>
+          <textarea
+            value={comment}
+            onChange={e => setComment(e.target.value)}
+            placeholder={t('compareRecordCommentPlaceholder', {}, lang)}
+            style={{ width: '100%', boxSizing: 'border-box', minHeight: 120, padding: '10px 12px', borderRadius: 8, border: '1px solid #E4E1DA', fontSize: 13, lineHeight: 1.6, resize: 'vertical', fontFamily: 'inherit', outline: 'none' }}
+          />
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+          <Btn variant="subtle" onClick={onClose}>{t('cancel', {}, lang)}</Btn>
+          <Btn onClick={() => onSave({ title: title.trim() || defaultTitle, comment: comment.trim() })}>{t('save', {}, lang)}</Btn>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function CompareHistoryPage({ sessions, onOpen, onDelete }) {
+  const lang = getLang();
+  if (!sessions.length) {
+    return <EmptyState icon="🗂️" title={t('noCompareRecords', {}, lang)} desc={t('noCompareRecordsHint', {}, lang)} />;
+  }
+  return (
+    <div style={{ padding: 16, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {sessions.map(session => (
+        <div key={session.id} style={{ background: '#fff', border: '1px solid #E4E1DA', borderRadius: 12, padding: 16, boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}>
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, marginBottom: 8 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <button
+                onClick={() => onOpen(session.id)}
+                style={{
+                  border: 'none',
+                  background: 'none',
+                  padding: 0,
+                  margin: 0,
+                  cursor: 'pointer',
+                  fontSize: 15,
+                  fontWeight: 700,
+                  color: '#1C1A17',
+                  marginBottom: 4,
+                  fontFamily: 'inherit',
+                  textAlign: 'left',
+                }}
+              >
+                {session.title}
+              </button>
+              <div style={{ fontSize: 12, color: '#9D9890' }}>
+                {t('recordRuns', { count: session.runRefs.length }, lang)} · {t('savedAt', {}, lang)} {fmtTime(session.createdAt)}
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <Btn small variant="subtle" onClick={() => onDelete(session.id)}>{t('deleteRecord', {}, lang)}</Btn>
+            </div>
+          </div>
+          {session.comment && (
+            <div style={{ fontSize: 13, color: '#6B6560', lineHeight: 1.6, marginBottom: 10, whiteSpace: 'pre-wrap' }}>{session.comment}</div>
+          )}
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {session.runRefs.map(ref => (
+              <span key={`${ref.project}:${ref.name}`} style={{ padding: '4px 8px', borderRadius: 20, background: '#F3F2EF', color: '#6B6560', fontSize: 12 }}>
+                {ref.alias || ref.name}{ref.project ? ` · ${ref.project}` : ''}
+              </span>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ComparePage({ runs, onBack, onOpenRun, settings, onSaveSession, onOpenHistory }) {
   const lang = getLang();
   const [histories, setHistories] = useState({});
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('charts');
   const [selectedMetrics, setSelectedMetrics] = useState(null);
+  const [saveOpen, setSaveOpen] = useState(false);
 
   const { apiKey, entity } = settings;
 
@@ -2439,7 +2603,9 @@ function ComparePage({ runs, onBack, onOpenRun, settings }) {
       <div style={{ padding: '12px 16px', borderBottom: '1px solid #E4E1DA', background: '#FAFAF8', flexShrink: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
           <button onClick={onBack} style={{ border: 'none', background: 'none', cursor: 'pointer', fontSize: 20, color: '#6B6560', padding: '0 4px' }}>←</button>
-          <span style={{ fontWeight: 700, fontSize: 16 }}>{t('compareRuns', { count: runs.length }, lang)}</span>
+          <span style={{ fontWeight: 700, fontSize: 16, flex: 1 }}>{t('compareRuns', { count: runs.length }, lang)}</span>
+          <Btn small variant="subtle" onClick={onOpenHistory}>{t('openCompareRecords', {}, lang)}</Btn>
+          <Btn small onClick={() => setSaveOpen(true)}>{t('saveCompareRecord', {}, lang)}</Btn>
         </div>
         {/* Run color legend — click to open detail */}
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
@@ -2536,6 +2702,16 @@ function ComparePage({ runs, onBack, onOpenRun, settings }) {
 
         {activeTab === 'summary' && <SummaryRow runs={runs} />}
       </div>
+      <SaveCompareModal
+        open={saveOpen}
+        runs={runs}
+        onClose={() => setSaveOpen(false)}
+        onSave={(payload) => {
+          onSaveSession(payload);
+          setSaveOpen(false);
+          alert(t('compareRecordSaved', {}, lang));
+        }}
+      />
     </div>
   );
 }
@@ -2543,7 +2719,7 @@ function ComparePage({ runs, onBack, onOpenRun, settings }) {
 const thStyle = { padding: '8px 12px', textAlign: 'left', fontSize: 12, fontWeight: 600, color: '#1C1A17', borderBottom: '1px solid #E4E1DA', whiteSpace: 'nowrap' };
 const tdStyle = { padding: '7px 12px', borderBottom: '1px solid #F0EDE7', color: '#1C1A17', verticalAlign: 'top' };
 
-Object.assign(window, { ComparePage });
+Object.assign(window, { ComparePage, CompareHistoryPage });
 </script>
   <script type="text/babel">// Main App Shell — routing, settings page, data fetching
 const { useState, useEffect, useCallback, useMemo } = React;
@@ -2557,6 +2733,7 @@ function SettingsPage({ onSaved, onLanguageChange }) {
   const [projects, setProjects] = useState((init.projects || []).join(', '));
   const [metrics,  setMetrics]  = useState((init.metrics  || ['train_loss']).join(', '));
   const [minEpoch, setMinEpoch] = useState(init.minEpoch ?? 2);
+  const [allowCrossProjectCompare, setAllowCrossProjectCompare] = useState(!!init.allowCrossProjectCompare);
   const [customProxy, setCustomProxy] = useState(init.customProxy || '');
   const [testing,  setTesting]  = useState(false);
   const [testMsg,  setTestMsg]  = useState('');
@@ -2579,6 +2756,7 @@ function SettingsPage({ onSaved, onLanguageChange }) {
       projects: projectList,
       metrics: metricList,
       minEpoch: Number(minEpoch),
+      allowCrossProjectCompare,
       customProxy: customProxy.trim()
     });
     if (!andTest) { onSaved(); return; }
@@ -2696,6 +2874,25 @@ function SettingsPage({ onSaved, onLanguageChange }) {
           </div>
         </div>
 
+        <div style={{ marginBottom: 18, padding: 12, background: '#F9F8F5', borderRadius: 8, border: '1px solid #E4E1DA' }}>
+          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={allowCrossProjectCompare}
+              onChange={e => setAllowCrossProjectCompare(e.target.checked)}
+              style={{ marginTop: 2, width: 15, height: 15, accentColor: '#4B6BFB', cursor: 'pointer' }}
+            />
+            <span>
+              <span style={{ display: 'block', fontSize: 13, fontWeight: 600, color: '#1C1A17' }}>
+                {t('allowCrossProjectCompare', {}, language)}
+              </span>
+              <span style={{ display: 'block', fontSize: 12, color: '#9D9890', marginTop: 3, lineHeight: 1.6 }}>
+                {t('allowCrossProjectCompareHint', {}, language)}
+              </span>
+            </span>
+          </label>
+        </div>
+
       <div style={{ marginBottom: 18, padding: 12, background: '#F9F8F5', borderRadius: 8, border: '1px solid #E4E1DA' }}>
         <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#4B6BFB', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
           {t('proxyLabel', {}, language)}
@@ -2735,6 +2932,7 @@ const NAV_ITEMS = [
   { key: 'list',     icon: '📋', labelKey: 'runList' },
   { key: 'favs',     icon: '⭐', labelKey: 'favorites' },
   { key: 'compare',  icon: '📊', labelKey: 'compare' },
+  { key: 'history',  icon: '🗂️', labelKey: 'compareRecords' },
   { key: 'settings', icon: '⚙️', labelKey: 'settings' },
 ];
 
@@ -2800,6 +2998,7 @@ function App() {
   const [runs, setRuns]               = useState([]);
   const [allMeta, setAllMeta]         = useState(WBStore.getAllMeta());
   const [tagLib, setTagLib]           = useState(WBStore.getTagLib());
+  const [compareSessions, setCompareSessions] = useState(WBStore.getCompareSessions());
   const [loading, setLoading]         = useState(false);
   const [loadMsg, setLoadMsg]         = useState('');
   const [error, setError]             = useState('');
@@ -2824,6 +3023,7 @@ function App() {
 
   const refreshMeta = useCallback(() => setAllMeta(WBStore.getAllMeta()), []);
   const refreshTagLib = useCallback(lib => setTagLib(lib || WBStore.getTagLib()), []);
+  const refreshCompareSessions = useCallback(() => setCompareSessions(WBStore.getCompareSessions()), []);
 
   const loadRuns = useCallback(async () => {
     const s = WBStore.getSettings();
@@ -2860,14 +3060,73 @@ function App() {
     refreshMeta();
   }, [refreshMeta]);
 
+  const handleSaveCompareSession = useCallback(({ title, comment }) => {
+    const now = new Date().toISOString();
+    WBStore.upsertCompareSession({
+      id: `cmp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
+      title,
+      comment,
+      allowCrossProject: !!settings.allowCrossProjectCompare,
+      createdAt: now,
+      updatedAt: now,
+      lastOpenedAt: now,
+      runRefs: compareSelected.map(r => ({
+        name: r.name,
+        project: r._project || settings.projects?.[0] || '',
+        alias: (WBStore.getMeta(r.name) || {}).alias || r.displayName || r.name,
+      })),
+    });
+    refreshCompareSessions();
+  }, [compareSelected, settings.allowCrossProjectCompare, settings.projects, refreshCompareSessions]);
+
+  const handleOpenCompareSession = useCallback((sessionId) => {
+    const session = WBStore.getCompareSessions().find(x => x.id === sessionId);
+    if (!session) return;
+    const restored = session.runRefs
+      .map(ref => runs.find(r => r.name === ref.name && ((r._project || settings.projects?.[0] || '') === (ref.project || ''))))
+      .filter(Boolean);
+    const missing = session.runRefs.length - restored.length;
+    if (missing > 0) alert(t('recordMissingRuns', { missing, total: session.runRefs.length }, lang));
+    if (restored.length < 2) {
+      alert(t('recordNeedTwoRuns', {}, lang));
+      return;
+    }
+    WBStore.upsertCompareSession({ ...session, lastOpenedAt: new Date().toISOString() });
+    refreshCompareSessions();
+    setCompare(restored);
+    setDetailRun(null);
+    setPage('compare');
+  }, [runs, settings.projects, lang, refreshCompareSessions]);
+
+  const handleDeleteCompareSession = useCallback((sessionId) => {
+    WBStore.deleteCompareSession(sessionId);
+    refreshCompareSessions();
+  }, [refreshCompareSessions]);
+
   const handleToggleCompare = useCallback(run => {
     setCompare(prev => {
       const exists = prev.some(r => r.name === run.name);
       if (exists) return prev.filter(r => r.name !== run.name);
+      if (!settings.allowCrossProjectCompare && prev.length > 0) {
+        const baseProject = prev[0]._project || settings.projects?.[0] || '';
+        const nextProject = run._project || settings.projects?.[0] || '';
+        if (baseProject && nextProject && baseProject !== nextProject) {
+          return [run];
+        }
+      }
       if (prev.length >= 5) return prev;
       return [...prev, run];
     });
-  }, []);
+  }, [settings.allowCrossProjectCompare, settings.projects]);
+
+  useEffect(() => {
+    if (settings.allowCrossProjectCompare) return;
+    setCompare(prev => {
+      if (prev.length < 2) return prev;
+      const baseProject = prev[0]?._project || settings.projects?.[0] || '';
+      return prev.filter(r => (r._project || settings.projects?.[0] || '') === baseProject);
+    });
+  }, [settings.allowCrossProjectCompare, settings.projects]);
 
   // Bridge for ListPage floating bar
   window.__goCompare    = () => setPage('compare');
@@ -2886,7 +3145,7 @@ function App() {
   const mainContent = () => {
     if (page === 'settings') {
       return <SettingsPage
-        onSaved={() => { setSettingsVersion(v => v + 1); refreshMeta(); setPage('list'); loadRuns(); }}
+        onSaved={() => { setSettingsVersion(v => v + 1); refreshMeta(); refreshCompareSessions(); setPage('list'); loadRuns(); }}
         onLanguageChange={() => setSettingsVersion(v => v + 1)}
       />;
     }
@@ -2939,6 +3198,18 @@ function App() {
           settings={settings}
           onBack={() => setPage('list')}
           onOpenRun={run => setDetailRun(run)}
+          onSaveSession={handleSaveCompareSession}
+          onOpenHistory={() => setPage('history')}
+        />
+      );
+    }
+
+    if (page === 'history') {
+      return (
+        <CompareHistoryPage
+          sessions={compareSessions}
+          onOpen={handleOpenCompareSession}
+          onDelete={handleDeleteCompareSession}
         />
       );
     }
